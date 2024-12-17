@@ -57,7 +57,9 @@ end
 
 
 local function new(self)
-  local _NODE = {}
+  local _NODE = {
+    hostname = nil,
+  }
 
 
   ---
@@ -247,20 +249,23 @@ local function new(self)
   -- @usage
   -- local hostname = kong.node.get_hostname()
   function _NODE.get_hostname()
-    local SIZE = 253 -- max number of chars for a hostname
+    if not _NODE.hostname then
+      local SIZE = 253 -- max number of chars for a hostname
 
-    local buf = ffi_new("unsigned char[?]", SIZE)
-    local res = C.gethostname(buf, SIZE)
+      local buf = ffi_new("unsigned char[?]", SIZE)
+      local res = C.gethostname(buf, SIZE)
 
-    if res == 0 then
-      local hostname = ffi_str(buf, SIZE)
-      return gsub(hostname, "%z+$", "")
+      if res ~= 0 then
+        -- Return an empty string "" instead of nil and error message,
+        -- because strerror is not thread-safe and the behavior of strerror_r
+        -- is inconsistent across different systems.
+        return ""
+      end
+
+      _NODE.hostname = gsub(ffi_str(buf, SIZE), "%z+$", "")
     end
 
-    local f = io.popen("/bin/hostname")
-    local hostname = f:read("*a") or ""
-    f:close()
-    return gsub(hostname, "\n$", "")
+    return _NODE.hostname
   end
 
 
@@ -272,6 +277,9 @@ local function new(self)
     -- 1. user provided node id
     local configuration_node_id = self and self.configuration and self.configuration.node_id
     if configuration_node_id then
+      ngx.log(ngx.WARN, "Manually specifying a `node_id` via configuration is deprecated as of 3.9 and will be removed in the 4.x.\n",
+      "We strongly recommend avoiding this practice.\n",
+      "Please note that if specified manually it must be unique across the cluster to ensure proper functionality.")
       node_id = configuration_node_id
     end
     -- 2. node id (if any) on file-system

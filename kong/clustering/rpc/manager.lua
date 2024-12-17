@@ -5,19 +5,22 @@ local _MT = { __index = _M, }
 local server = require("resty.websocket.server")
 local client = require("resty.websocket.client")
 local socket = require("kong.clustering.rpc.socket")
-local concentrator = require("kong.clustering.rpc.concentrator")
 local future = require("kong.clustering.rpc.future")
 local utils = require("kong.clustering.rpc.utils")
+local jsonrpc = require("kong.clustering.rpc.json_rpc_v2")
 local callbacks = require("kong.clustering.rpc.callbacks")
 local clustering_tls = require("kong.clustering.tls")
 local constants = require("kong.constants")
 local table_isempty = require("table.isempty")
 local pl_tablex = require("pl.tablex")
 local cjson = require("cjson.safe")
+local string_tools = require("kong.tools.string")
 
 
+local ipairs = ipairs
 local ngx_var = ngx.var
 local ngx_ERR = ngx.ERR
+local ngx_DEBUG = ngx.DEBUG
 local ngx_log = ngx.log
 local ngx_exit = ngx.exit
 local ngx_time = ngx.time
@@ -27,6 +30,10 @@ local cjson_encode = cjson.encode
 local cjson_decode = cjson.decode
 local validate_client_cert = clustering_tls.validate_client_cert
 local CLUSTERING_PING_INTERVAL = constants.CLUSTERING_PING_INTERVAL
+
+
+local RPC_MATA_V1 = "kong.meta.v1"
+local RPC_SNAPPY_FRAMED = "x-snappy-framed"
 
 
 local WS_OPTS = {
@@ -42,7 +49,6 @@ function _M.new(conf, node_id)
     -- clients[node_id]: { socket1 => true, socket2 => true, ... }
     clients = {},
     client_capabilities = {},
-    client_ips = {},  -- store DP node's ip addr
     node_id = node_id,
     conf = conf,
     cluster_cert = assert(clustering_tls.get_cluster_cert(conf)),
@@ -50,24 +56,27 @@ function _M.new(conf, node_id)
     callbacks = callbacks.new(),
   }
 
-  self.concentrator = concentrator.new(self, kong.db)
+  if conf.role == "control_plane" then
+    self.concentrator = require("kong.clustering.rpc.concentrator").new(self, kong.db)
+    self.client_info = {}  -- store DP node's ip addr and version
+  end
 
   return setmetatable(self, _MT)
 end
 
 
-function _M:_add_socket(socket, capabilities_list)
-  local sockets = self.clients[socket.node_id]
-  if not sockets then
-    assert(self.concentrator:_enqueue_subscribe(socket.node_id))
-    sockets = setmetatable({}, { __mode = "k", })
-    self.clients[socket.node_id] = sockets
-  end
+function _M:_add_socket(socket)
+  local node_id = socket.node_id
 
-  self.client_capabilities[socket.node_id] = {
-    set = pl_tablex_makeset(capabilities_list),
-    list = capabilities_list,
-  }
+  local sockets = self.clients[node_id]
+  if not sockets then
+    if self.concentrator then
+      assert(self.concentrator:_enqueue_subscribe(node_id))
+    end
+
+    sockets = setmetatable({}, { __mode = "k", })
+    self.clients[node_id] = sockets
+  end
 
   assert(not sockets[socket])
 
@@ -85,9 +94,12 @@ function _M:_remove_socket(socket)
 
   if table_isempty(sockets) then
     self.clients[node_id] = nil
-    self.client_ips[node_id] = nil
     self.client_capabilities[node_id] = nil
-    assert(self.concentrator:_enqueue_unsubscribe(node_id))
+
+    if self.concentrator then
+      self.client_info[node_id] = nil
+      assert(self.concentrator:_enqueue_unsubscribe(node_id))
+    end
   end
 end
 
@@ -107,6 +119,9 @@ function _M:_find_node_and_check_capability(node_id, cap)
     return "local"
   end
 
+  -- now we are on cp side
+  assert(self.concentrator)
+
   -- does concentrator knows more about this client?
   local res, err = kong.db.clustering_data_planes:select({ id = node_id })
   if err then
@@ -125,6 +140,135 @@ function _M:_find_node_and_check_capability(node_id, cap)
 
   return nil, "requested capability does not exist, capability: " ..
               cap .. ", node_id: " .. node_id
+end
+
+
+-- CP => DP
+function _M:_handle_meta_call(c)
+  local data, typ, err = c:recv_frame()
+  if err then
+    return nil, err
+  end
+
+  if typ ~= "binary" then
+    return nil, "wrong frame type: " .. type
+  end
+
+  local payload = cjson_decode(data)
+  assert(payload.jsonrpc == jsonrpc.VERSION)
+
+  if payload.method ~= RPC_MATA_V1 .. ".hello" then
+    return nil, "wrong RPC meta call: " .. tostring(payload.method)
+  end
+
+  local info = payload.params[1]
+
+  local snappy_supported
+  for _, v in ipairs(info.rpc_frame_encodings) do
+    if v == RPC_SNAPPY_FRAMED then
+      snappy_supported = true
+      break
+    end
+  end
+
+  if not snappy_supported then
+    return nil, "unknown encodings: " .. cjson_encode(info.rpc_frame_encodings)
+  end
+
+  -- should have necessary info
+  assert(type(info.kong_version) == "string")
+  assert(type(info.kong_node_id) == "string")
+  assert(type(info.kong_hostname) == "string")
+  assert(type(info.kong_conf) == "table")
+
+  local payload = {
+    jsonrpc = jsonrpc.VERSION,
+    result = {
+      rpc_capabilities = self.callbacks:get_capabilities_list(),
+      -- now we only support snappy
+      rpc_frame_encoding = RPC_SNAPPY_FRAMED,
+      },
+    id = 1,
+  }
+
+  local bytes, err = c:send_binary(cjson_encode(payload))
+  if not bytes then
+    return nil, err
+  end
+
+  local capabilities_list = info.rpc_capabilities
+  local node_id = info.kong_node_id
+
+  self.client_capabilities[node_id] = {
+    set = pl_tablex_makeset(capabilities_list),
+    list = capabilities_list,
+  }
+
+  -- we are on cp side
+  assert(self.concentrator)
+  assert(self.client_info)
+
+  -- store DP's ip addr
+  self.client_info[node_id] = {
+    ip = ngx_var.remote_addr,
+    version = info.kong_version,
+  }
+
+  return node_id
+end
+
+
+-- DP => CP
+function _M:_meta_call(c, meta_cap, node_id)
+  local info = {
+    rpc_capabilities = self.callbacks:get_capabilities_list(),
+
+    -- now we only support snappy
+    rpc_frame_encodings =  { RPC_SNAPPY_FRAMED, },
+
+    kong_version = KONG_VERSION,
+    kong_hostname = kong.node.get_hostname(),
+    kong_node_id = self.node_id,
+    kong_conf = kong.configuration.remove_sensitive(),
+  }
+
+  local payload = {
+    jsonrpc = jsonrpc.VERSION,
+    method = meta_cap .. ".hello",
+    params = { info },
+    id = 1,
+  }
+
+  local bytes, err = c:send_binary(cjson_encode(payload))
+  if not bytes then
+    return nil, err
+  end
+
+  local data, typ, err = c:recv_frame()
+  if err then
+    return nil, err
+  end
+
+  if typ ~= "binary" then
+    return nil, "wrong frame type: " .. typ
+  end
+
+  local payload = cjson_decode(data)
+  assert(payload.jsonrpc == jsonrpc.VERSION)
+
+  -- now we only support snappy
+  if payload.result.rpc_frame_encoding ~= RPC_SNAPPY_FRAMED then
+    return nil, "unknown encoding: " .. payload.result.rpc_frame_encoding
+  end
+
+  local capabilities_list = payload.result.rpc_capabilities
+
+  self.client_capabilities[node_id] = {
+    set = pl_tablex_makeset(capabilities_list),
+    list = capabilities_list,
+  }
+
+  return true
 end
 
 
@@ -172,11 +316,21 @@ function _M:call(node_id, method, ...)
 
   local params = {...}
 
+  ngx_log(ngx_DEBUG,
+    "[rpc] calling ", method,
+    "(node_id: ", node_id, ")",
+    " via ", res == "local" and "local" or "concentrator"
+  )
+
   if res == "local" then
     res, err = self:_local_call(node_id, method, params)
+
     if not res then
+      ngx_log(ngx_DEBUG, "[rpc] ", method, " failed, err: ", err)
       return nil, err
     end
+
+    ngx_log(ngx_DEBUG, "[rpc] ", method, " succeeded")
 
     return res
   end
@@ -188,13 +342,20 @@ function _M:call(node_id, method, ...)
   assert(fut:start())
 
   local ok, err = fut:wait(5)
+
   if err then
+    ngx_log(ngx_DEBUG, "[rpc] ", method, " failed, err: ", err)
+
     return nil, err
   end
 
   if ok then
+    ngx_log(ngx_DEBUG, "[rpc] ", method, " succeeded")
+
     return fut.result
   end
+
+  ngx_log(ngx_DEBUG, "[rpc] ", method, " failed, err: ", fut.error.message)
 
   return nil, fut.error.message
 end
@@ -202,42 +363,24 @@ end
 
 -- handle incoming client connections
 function _M:handle_websocket()
-  local kong_version = ngx_var.http_x_kong_version
-  local node_id = ngx_var.http_x_kong_node_id
   local rpc_protocol = ngx_var.http_sec_websocket_protocol
-  local content_encoding = ngx_var.http_content_encoding
-  local rpc_capabilities = ngx_var.http_x_kong_rpc_capabilities
 
-  if not kong_version then
-    ngx_log(ngx_ERR, "[rpc] client did not provide version number")
-    return ngx_exit(ngx.HTTP_CLOSE)
+  local meta_v1_supported
+  local protocols = string_tools.split(rpc_protocol, ",")
+
+  -- choice a proper protocol
+  for _, v in ipairs(protocols) do
+    -- now we only support kong.meta.v1
+    if RPC_MATA_V1 == string_tools.strip(v) then
+      meta_v1_supported = true
+      break
+    end
   end
 
-  if not node_id then
-    ngx_log(ngx_ERR, "[rpc] client did not provide node ID")
-    return ngx_exit(ngx.HTTP_CLOSE)
-  end
-
-  if content_encoding ~= "x-snappy-framed" then
-    ngx_log(ngx_ERR, "[rpc] client does use Snappy compressed frames")
-    return ngx_exit(ngx.HTTP_CLOSE)
-  end
-
-  if rpc_protocol ~= "kong.rpc.v1" then
+  if not meta_v1_supported then
     ngx_log(ngx_ERR, "[rpc] unknown RPC protocol: " ..
                      tostring(rpc_protocol) ..
                      ", doesn't know how to communicate with client")
-    return ngx_exit(ngx.HTTP_CLOSE)
-  end
-
-  if not rpc_capabilities then
-    ngx_log(ngx_ERR, "[rpc] client did not provide capability list")
-    return ngx_exit(ngx.HTTP_CLOSE)
-  end
-
-  rpc_capabilities = cjson_decode(rpc_capabilities)
-  if not rpc_capabilities then
-    ngx_log(ngx_ERR, "[rpc] failed to decode client capability list")
     return ngx_exit(ngx.HTTP_CLOSE)
   end
 
@@ -247,7 +390,8 @@ function _M:handle_websocket()
     return ngx_exit(ngx.HTTP_CLOSE)
   end
 
-  ngx.header["X-Kong-RPC-Capabilities"] = cjson_encode(self.callbacks:get_capabilities_list())
+  -- now we only use kong.meta.v1
+  ngx.header["Sec-WebSocket-Protocol"] = RPC_MATA_V1
 
   local wb, err = server:new(WS_OPTS)
   if not wb then
@@ -255,11 +399,15 @@ function _M:handle_websocket()
     return ngx_exit(ngx.HTTP_CLOSE)
   end
 
-  local s = socket.new(self, wb, node_id)
-  self:_add_socket(s, rpc_capabilities)
+  -- if timeout (default is 5s) we will close the connection
+  local node_id, err = self:_handle_meta_call(wb)
+  if not node_id then
+    ngx_log(ngx_ERR, "[rpc] unable to handshake with client: ", err)
+    return ngx_exit(ngx.HTTP_CLOSE)
+  end
 
-  -- store DP's ip addr
-  self.client_ips[node_id] = ngx_var.remote_addr
+  local s = socket.new(self, wb, node_id)
+  self:_add_socket(s)
 
   s:start()
   local res, err = s:join()
@@ -274,6 +422,30 @@ function _M:handle_websocket()
 end
 
 
+function _M:try_connect(reconnection_delay)
+  ngx.timer.at(reconnection_delay or 0, function(premature)
+    self:connect(premature,
+                 "control_plane", -- node_id
+                 self.conf.cluster_control_plane, -- host
+                 "/v2/outlet",  -- path
+                 self.cluster_cert.cdata,
+                 self.cluster_cert_key)
+  end)
+end
+
+
+function _M:init_worker()
+  if self.conf.role == "data_plane" then
+    -- data_plane will try to connect to cp
+    self:try_connect()
+
+  else
+    -- control_plane
+    self.concentrator:start()
+  end
+end
+
+
 function _M:connect(premature, node_id, host, path, cert, key)
   if premature then
     return
@@ -285,14 +457,7 @@ function _M:connect(premature, node_id, host, path, cert, key)
     ssl_verify = true,
     client_cert = cert,
     client_priv_key = key,
-    protocols = "kong.rpc.v1",
-    headers = {
-      "X-Kong-Version: " .. KONG_VERSION,
-      "X-Kong-Node-Id: " .. self.node_id,
-      "X-Kong-Hostname: " .. kong.node.get_hostname(),
-      "X-Kong-RPC-Capabilities: " .. cjson_encode(self.callbacks:get_capabilities_list()),
-      "Content-Encoding: x-snappy-framed"
-    },
+    protocols = RPC_MATA_V1,
   }
 
   if self.conf.cluster_mtls == "shared" then
@@ -318,24 +483,34 @@ function _M:connect(premature, node_id, host, path, cert, key)
   do
     local resp_headers = c:get_resp_headers()
     -- FIXME: resp_headers should not be case sensitive
-    if not resp_headers or not resp_headers["x_kong_rpc_capabilities"] then
-      ngx_log(ngx_ERR, "[rpc] peer did not provide capability list, node_id: ", node_id)
+
+    if not resp_headers or not resp_headers["sec_websocket_protocol"] then
+      ngx_log(ngx_ERR, "[rpc] peer did not provide sec_websocket_protocol, node_id: ", node_id)
       c:send_close() -- can't do much if this fails
       goto err
     end
 
-    local capabilities = resp_headers["x_kong_rpc_capabilities"]
-    capabilities = cjson_decode(capabilities)
-    if not capabilities then
-      ngx_log(ngx_ERR, "[rpc] unable to decode peer capability list, node_id: ", node_id,
-                       " list: ", capabilities)
+    -- should like "kong.meta.v1"
+    local meta_cap = resp_headers["sec_websocket_protocol"]
+
+    if meta_cap ~= RPC_MATA_V1 then
+      ngx_log(ngx_ERR, "[rpc] did not support protocol : ", meta_cap)
+      c:send_close() -- can't do much if this fails
+      goto err
+    end
+
+    -- if timeout (default is 5s) we will close the connection
+    local ok, err = self:_meta_call(c, meta_cap, node_id)
+    if not ok then
+      ngx_log(ngx_ERR, "[rpc] unable to handshake with server, node_id: ", node_id,
+                       " err: ", err)
       c:send_close() -- can't do much if this fails
       goto err
     end
 
     local s = socket.new(self, c, node_id)
     s:start()
-    self:_add_socket(s, capabilities)
+    self:_add_socket(s)
 
     ok, err = s:join() -- main event loop
 
@@ -350,9 +525,7 @@ function _M:connect(premature, node_id, host, path, cert, key)
   ::err::
 
   if not exiting() then
-    ngx.timer.at(reconnection_delay, function(premature)
-      self:connect(premature, node_id, host, path, cert, key)
-    end)
+    self:try_connect(reconnection_delay)
   end
 end
 
@@ -368,8 +541,8 @@ function _M:get_peers()
 end
 
 
-function _M:get_peer_ip(node_id)
-  return self.client_ips[node_id]
+function _M:get_peer_info(node_id)
+  return self.client_info[node_id]
 end
 
 

@@ -1,6 +1,7 @@
 local helpers = require "spec.helpers"
 local cjson = require "cjson"
 local pl_file = require "pl.file"
+local ssl_fixtures = require "spec.fixtures.ssl"
 
 
 local strip = require("kong.tools.string").strip
@@ -58,11 +59,10 @@ local _EXPECTED_CHAT_STATS = {
       time_per_token = 1,
       cost = 0.00037,
     },
-    cache = {}
   },
 }
 
-for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
+for _, strategy in helpers.all_strategies() do
   describe(PLUGIN_NAME .. ": (access) [#" .. strategy .. "]", function()
     local client
 
@@ -232,12 +232,24 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
         path = "/",
       })
 
+      local certificate = bp.certificates:insert {
+        cert = ssl_fixtures.cert_alt_alt,
+        key = ssl_fixtures.key_alt_alt,
+        cert_alt = ssl_fixtures.cert_alt_alt_ecdsa,
+        key_alt = ssl_fixtures.key_alt_alt_ecdsa,
+      }
+      bp.snis:insert {
+        name = "example.test",
+        certificate = certificate,
+      }
+
       -- 200 chat good with one option
       local chat_good = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/chat/good" }
+        paths = { "/openai/llm/v1/chat/good" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -287,9 +299,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 200 chat good with one option
       local chat_good_no_allow_override = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/chat/good-no-allow-override" }
+        paths = { "/openai/llm/v1/chat/good-no-allow-override" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -323,9 +336,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 200 chat good with statistics disabled
       local chat_good_no_stats = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/chat/good-without-stats" }
+        paths = { "/openai/llm/v1/chat/good-without-stats" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -363,9 +377,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 200 chat good with all logging enabled
       local chat_good_log_payloads = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/chat/good-with-payloads" }
+        paths = { "/openai/llm/v1/chat/good-with-payloads" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -403,9 +418,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 200 chat bad upstream response with one option
       local chat_bad_upstream = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/chat/bad_upstream_response" }
+        paths = { "/openai/llm/v1/chat/bad_upstream_response" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -432,9 +448,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 200 completions good with one option
       local completions_good = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/completions/good" }
+        paths = { "/openai/llm/v1/completions/good" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -461,9 +478,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 200 completions good using query param key
       local completions_good_one_query_param = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/completions/query-param-auth" }
+        paths = { "/openai/llm/v1/completions/query-param-auth" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -491,9 +509,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 200 completions good using query param key with no allow override
       local completions_good_one_query_param_no_allow_override = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/completions/query-param-auth-no-allow-override" }
+        paths = { "/openai/llm/v1/completions/query-param-auth-no-allow-override" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -523,9 +542,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 200 embeddings (preserve route mode) good
       local chat_good = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/embeddings/good" }
+        paths = { "/openai/llm/v1/embeddings/good" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -556,9 +576,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 200 chat good but no model set in plugin config
       local chat_good_no_model = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https"},
         strip_path = true,
-        paths = { "/openai/llm/v1/chat/good-no-model-param" }
+        paths = { "/openai/llm/v1/chat/good-no-model-param" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -600,9 +621,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 200 completions good using post body key
       local completions_good_post_body_key = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https"},
         strip_path = true,
-        paths = { "/openai/llm/v1/completions/post-body-auth" }
+        paths = { "/openai/llm/v1/completions/post-body-auth" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -630,9 +652,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 200 completions good using post body key
       local completions_good_post_body_key_no_allow_override = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/completions/post-body-auth-no-allow-override" }
+        paths = { "/openai/llm/v1/completions/post-body-auth-no-allow-override" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -662,9 +685,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 401 unauthorized
       local chat_401 = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/chat/unauthorized" }
+        paths = { "/openai/llm/v1/chat/unauthorized" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -691,9 +715,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 400 bad request chat
       local chat_400 = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/chat/bad_request" }
+        paths = { "/openai/llm/v1/chat/bad_request" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -720,9 +745,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 400 bad request completions
       local chat_400_comp = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/completions/bad_request" }
+        paths = { "/openai/llm/v1/completions/bad_request" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -749,9 +775,10 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       -- 500 internal server error
       local chat_500 = assert(bp.routes:insert {
         service = empty_service,
-        protocols = { "http" },
+        protocols = { "http", "https" },
         strip_path = true,
-        paths = { "/openai/llm/v1/chat/internal_server_error" }
+        paths = { "/openai/llm/v1/chat/internal_server_error" },
+        snis = { "example.test" },
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
@@ -773,7 +800,7 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
           },
         },
       }
-      
+
 
       -- start kong
       assert(helpers.start_kong({
@@ -785,6 +812,7 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
         plugins = "bundled,ctx-checker-last,ctx-checker," .. PLUGIN_NAME,
         -- write & load declarative config, only if 'strategy=off'
         declarative_config = strategy == "off" and helpers.make_yaml_file() or nil,
+        log_level = "info",
       }, nil, nil, fixtures))
     end)
 
@@ -838,21 +866,19 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
         assert.is_number(log_message.request.size)
         assert.is_number(log_message.response.size)
 
-        -- test ai-proxy stats
-        -- TODO: as we are reusing this test for ai-proxy and ai-proxy-advanced
-        -- we are currently stripping the top level key and comparing values directly
+        -- test ai-proxy or ai-proxy-advanced stats (both in log_message.ai.proxy namespace)
         local _, first_expected = next(_EXPECTED_CHAT_STATS)
         local _, first_got = next(log_message.ai)
         local actual_llm_latency = first_got.meta.llm_latency
         local actual_time_per_token = first_got.usage.time_per_token
-        local time_per_token = math.floor(actual_llm_latency / first_got.usage.completion_tokens)
+        local time_per_token = actual_llm_latency / first_got.usage.completion_tokens
 
         first_got.meta.llm_latency = 1
         first_got.usage.time_per_token = 1
 
         assert.same(first_expected, first_got)
         assert.is_true(actual_llm_latency >= 0)
-        assert.same(actual_time_per_token, time_per_token)
+        assert.same(tonumber(string.format("%.3f", actual_time_per_token)), tonumber(string.format("%.3f", time_per_token)))
         assert.same(first_got.meta.request_model, "gpt-3.5-turbo")
       end)
 
@@ -925,8 +951,8 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
         local _, message = next(log_message.ai)
 
         -- test request bodies
-        assert.matches('"content": "What is 1 + 1?"', message.payload.request, nil, true)
-        assert.matches('"role": "user"', message.payload.request, nil, true)
+        assert.matches('"content":"What is 1 + 1?"', message.payload.request, nil, true)
+        assert.matches('"role":"user"', message.payload.request, nil, true)
 
         -- test response bodies
         assert.matches('"content": "The sum of 1 + 1 is 2.",', message.payload.response, nil, true)
@@ -1049,9 +1075,24 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
           content = "The sum of 1 + 1 is 2.",
           role = "assistant",
         }, json.choices[1].message)
+      end)
 
-        -- from ctx-checker-last plugin
-        assert.equals(r.headers["ctx-checker-last-llm-model-requested"], "gpt-3.5-turbo")
+      it("good request with http2", function()
+        local curl_command = string.format("curl -X GET -k --resolve example.test:%s:127.0.0.1  -H 'Content-Type: application/json' https://example.test:%s/openai/llm/v1/chat/good -d @spec/fixtures/ai-proxy/openai/llm-v1-chat/requests/good.json", helpers.get_proxy_port(true), helpers.get_proxy_port(true))
+        local output = io.popen(curl_command):read("*a")
+        local json = assert(cjson.decode(output))
+
+        -- in this case, origin is "undxpected error" message
+        assert.equals(json.message, nil)
+        assert.equals(json.id, "chatcmpl-8T6YwgvjQVVnGbJ2w8hpOA17SeNy2")
+        assert.equals(json.model, "gpt-3.5-turbo-0613")
+        assert.equals(json.object, "chat.completion")
+        assert.is_table(json.choices)
+        assert.is_table(json.choices[1].message)
+        assert.same({
+          content = "The sum of 1 + 1 is 2.",
+          role = "assistant",
+        }, json.choices[1].message)
       end)
 
       it("good request, parses model of cjson.null", function()
@@ -1130,7 +1171,7 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
 
         -- check this is in the 'kong' response format
         assert.is_truthy(json.error)
-        assert.equals(json.error.message, "request format not recognised")
+        assert.equals(json.error.message, "request body doesn't contain valid prompts")
       end)
 
       -- check that kong.ctx.shared.llm_model_requested is set
@@ -1159,9 +1200,6 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
           content = "The sum of 1 + 1 is 2.",
           role = "assistant",
         }, json.choices[1].message)
-
-        -- from ctx-checker-last plugin
-        assert.equals(r.headers["ctx-checker-last-llm-model-requested"], "try-to-override-the-model")
       end)
 
     end)
@@ -1204,7 +1242,7 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
 
         -- check this is in the 'kong' response format
         assert.is_truthy(json.error)
-        assert.equals("request format not recognised", json.error.message)
+        assert.equals("request body doesn't contain valid prompts", json.error.message)
       end)
     end)
 
@@ -1454,7 +1492,7 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       end)
     end)
 
-    describe("#aaa openai multi-modal requests", function()
+    describe("openai multi-modal requests", function()
       it("logs statistics", function()
         local r = client:get("/openai/llm/v1/chat/good", {
           headers = {
@@ -1485,21 +1523,20 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
         assert.is_number(log_message.request.size)
         assert.is_number(log_message.response.size)
 
-        -- test ai-proxy stats
-        -- TODO: as we are reusing this test for ai-proxy and ai-proxy-advanced
-        -- we are currently stripping the top level key and comparing values directly
+        -- test ai-proxy or ai-proxy-advanced stats (both in log_message.ai.proxy namespace)
         local _, first_expected = next(_EXPECTED_CHAT_STATS)
         local _, first_got = next(log_message.ai)
+
         local actual_llm_latency = first_got.meta.llm_latency
         local actual_time_per_token = first_got.usage.time_per_token
-        local time_per_token = math.floor(actual_llm_latency / first_got.usage.completion_tokens)
+        local time_per_token = actual_llm_latency / first_got.usage.completion_tokens
 
         first_got.meta.llm_latency = 1
         first_got.usage.time_per_token = 1
 
         assert.same(first_expected, first_got)
         assert.is_true(actual_llm_latency >= 0)
-        assert.same(actual_time_per_token, time_per_token)
+        assert.same(tonumber(string.format("%.3f", actual_time_per_token)), tonumber(string.format("%.3f", time_per_token)))
       end)
 
       it("logs payloads", function()
@@ -1537,8 +1574,8 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
         local _, message = next(log_message.ai)
 
         -- test request bodies
-        assert.matches('"text": "What\'s in this image?"', message.payload.request, nil, true)
-        assert.matches('"role": "user"', message.payload.request, nil, true)
+        assert.matches('"text":"What\'s in this image?"', message.payload.request, nil, true)
+        assert.matches('"role":"user"', message.payload.request, nil, true)
 
         -- test response bodies
         assert.matches('"content": "The sum of 1 + 1 is 2.",', message.payload.response, nil, true)
@@ -1646,4 +1683,4 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
     end)
   end)
 
-end end
+end

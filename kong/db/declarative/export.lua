@@ -95,6 +95,23 @@ local function end_transaction(db)
 end
 
 
+local get_latest_version
+do
+  local strategy
+
+  local function get_latest_version_real()
+    return strategy:get_latest_version()
+  end
+
+  get_latest_version = function()
+    -- ensure we get the initialized kong.db
+    strategy = require("kong.clustering.services.sync.strategies.postgres").new(kong.db)
+    get_latest_version = get_latest_version_real
+    return get_latest_version()
+  end
+end
+
+
 local function export_from_db_impl(emitter, skip_ws, skip_disabled_entities, expand_foreigns)
   local schemas = {}
 
@@ -119,12 +136,7 @@ local function export_from_db_impl(emitter, skip_ws, skip_disabled_entities, exp
 
   local sync_version
   if emitter.want_sync_version then
-    ok, err = db.connector:query("SELECT max(version) from clustering_sync_version", "read")
-    if not ok then
-      return nil, err
-    end
-
-    sync_version = assert(ok[1].max)
+    sync_version = get_latest_version()
   end
 
   emitter:emit_toplevel({
@@ -359,7 +371,8 @@ local sync_emitter = {
 
   emit_entity = function(self, entity_name, entity_data)
     self.out_n = self.out_n + 1
-    self.out[self.out_n] = { type = entity_name , row = entity_data, version = self.sync_version, }
+    self.out[self.out_n] = { type = entity_name , entity = entity_data, version = self.sync_version,
+                             ws_id = kong.default_workspace, }
   end,
 
   done = function(self)

@@ -41,9 +41,7 @@ local foreign_children = {}
 
 do
   local tb_nkeys = require("table.nkeys")
-  local request_aware_table = require("kong.tools.request_aware_table")
-
-  local CACHED_OUT
+  local buffer = require("string.buffer")
 
   -- Generate a stable and unique string key from primary key defined inside
   -- schema, supports both non-composite and composite primary keys
@@ -55,17 +53,27 @@ do
       return tostring(object[primary_key[1]])
     end
 
-    if not CACHED_OUT then
-      CACHED_OUT = request_aware_table.new()
-    end
+    local buf = buffer.new()
 
-    CACHED_OUT.clear()
+    -- The logic comes from get_cache_key_value(), which uses `id` directly to
+    -- extract foreign key.
+    -- TODO: extract primary key recursively using pk_string(), KAG-5750
     for i = 1, count do
       local k = primary_key[i]
-      insert(CACHED_OUT, tostring(object[k]))
+      local v = object[k]
+
+      if type(v) == "table" and schema.fields[k].type == "foreign" then
+        v = v.id
+      end
+
+      buf:put(tostring(v or ""))
+
+      if i < count then
+        buf:put(":")
+      end
     end
 
-    return concat(CACHED_OUT, ":")
+    return buf:get()
   end
 end
 
@@ -353,6 +361,22 @@ local function uniqueness_error_msg(entity, key, value)
          "with " .. key .. " set to '" .. value .. "' already declared"
 end
 
+local function add_error(errs, parent_entity, parent_idx, entity, entity_idx, err)
+  if parent_entity and parent_idx then
+    errs[parent_entity]                     = errs[parent_entity] or {}
+    errs[parent_entity][parent_idx]         = errs[parent_entity][parent_idx] or {}
+    errs[parent_entity][parent_idx][entity] = errs[parent_entity][parent_idx][entity] or {}
+
+    -- e.g. errs["upstreams"][5]["targets"][2]
+    errs[parent_entity][parent_idx][entity][entity_idx] = err
+
+  else
+    errs[entity] = errs[entity] or {}
+
+    -- e.g. errs["consumers"][3]
+    errs[entity][entity_idx] = err
+  end
+end
 
 local function populate_references(input, known_entities, by_id, by_key, expected, errs, parent_entity, parent_idx)
   for _, entity in ipairs(known_entities) do
@@ -392,8 +416,8 @@ local function populate_references(input, known_entities, by_id, by_key, expecte
       if key and key ~= ngx.null then
         local ok = add_to_by_key(by_key, entity_schema, item, entity, key)
         if not ok then
-          errs[entity] = errs[entity] or {}
-          errs[entity][i] = uniqueness_error_msg(entity, endpoint_key, key)
+          add_error(errs, parent_entity, parent_idx, entity, i,
+                    uniqueness_error_msg(entity, endpoint_key, key))
           failed = true
         end
       end
@@ -401,22 +425,8 @@ local function populate_references(input, known_entities, by_id, by_key, expecte
       if item_id then
         by_id[entity] = by_id[entity] or {}
         if (not failed) and by_id[entity][item_id] then
-          local err_t
-
-          if parent_entity and parent_idx then
-            errs[parent_entity]                     = errs[parent_entity] or {}
-            errs[parent_entity][parent_idx]         = errs[parent_entity][parent_idx] or {}
-            errs[parent_entity][parent_idx][entity] = errs[parent_entity][parent_idx][entity] or {}
-
-            -- e.g. errs["upstreams"][5]["targets"]
-            err_t = errs[parent_entity][parent_idx][entity]
-
-          else
-            errs[entity] = errs[entity] or {}
-            err_t = errs[entity]
-          end
-
-          err_t[i] = uniqueness_error_msg(entity, "primary key", item_id)
+          add_error(errs, parent_entity, parent_idx, entity, i,
+                    uniqueness_error_msg(entity, "primary key", item_id))
 
         else
           by_id[entity][item_id] = item

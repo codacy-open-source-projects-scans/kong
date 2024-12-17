@@ -1,9 +1,10 @@
 local helpers = require "spec.helpers"
 local cjson = require("cjson.safe")
+local CLUSTERING_SYNC_STATUS = require("kong.constants").CLUSTERING_SYNC_STATUS
 
-for _, inc_sync in ipairs { "on", "off"  } do
+-- register a test rpc service in custom plugin rpc-hello-test
 for _, strategy in helpers.each_strategy() do
-  describe("Hybrid Mode RPC #" .. strategy .. " inc_sync=" .. inc_sync, function()
+  describe("Hybrid Mode RPC #" .. strategy, function()
 
     lazy_setup(function()
       helpers.get_db_utils(strategy, {
@@ -17,7 +18,9 @@ for _, strategy in helpers.each_strategy() do
         database = strategy,
         cluster_listen = "127.0.0.1:9005",
         nginx_conf = "spec/fixtures/custom_nginx.template",
-        cluster_incremental_sync = inc_sync, -- incremental sync
+        cluster_rpc = "on",
+        plugins = "bundled,rpc-hello-test",
+        cluster_incremental_sync = "off",
       }))
 
       assert(helpers.start_kong({
@@ -29,7 +32,9 @@ for _, strategy in helpers.each_strategy() do
         cluster_control_plane = "127.0.0.1:9005",
         proxy_listen = "0.0.0.0:9002",
         nginx_conf = "spec/fixtures/custom_nginx.template",
-        cluster_incremental_sync = inc_sync, -- incremental sync
+        cluster_rpc = "on",
+        plugins = "bundled,rpc-hello-test",
+        cluster_incremental_sync = "off",
       }))
     end)
 
@@ -50,13 +55,28 @@ for _, strategy in helpers.each_strategy() do
           local body = assert.res_status(200, res)
           local json = cjson.decode(body)
 
+          assert(json)
+
+          -- TODO: perhaps need a new test method
           for _, v in pairs(json.data) do
             if v.ip == "127.0.0.1" and v.rpc_capabilities and #v.rpc_capabilities ~= 0 then
-              table.sort(v.rpc_capabilities)
               assert.near(14 * 86400, v.ttl, 3)
-              -- kong.debug.log_level.v1 should be the first rpc service
-              assert.same("kong.debug.log_level.v1", v.rpc_capabilities[1])
-              return true
+              assert.matches("^(%d+%.%d+)%.%d+", v.version)
+              assert.equal(CLUSTERING_SYNC_STATUS.NORMAL, v.sync_status)
+
+              local reg = [[^(\d+)\.(\d+)]]
+              local m = assert(ngx.re.match(v.version, reg))
+              assert(tonumber(m[1]) >= 3)
+              assert(tonumber(m[2]) >= 9)
+
+              -- check the available rpc service
+              for _, c in ipairs(v.rpc_capabilities) do
+                if c == "kong.test" then
+                  return true
+                end
+              end
+
+              return false
             end
           end
         end, 10)
@@ -64,4 +84,3 @@ for _, strategy in helpers.each_strategy() do
     end)
   end)
 end -- for _, strategy
-end -- for inc_sync

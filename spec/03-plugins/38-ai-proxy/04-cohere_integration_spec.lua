@@ -5,9 +5,8 @@ local pl_file = require "pl.file"
 local PLUGIN_NAME = "ai-proxy"
 local MOCK_PORT = helpers.get_available_port()
 
-for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
-  describe(PLUGIN_NAME .. ": (access) [#" .. strategy .. "]", function()
-    local client
+for _, strategy in helpers.all_strategies() do
+  describe(PLUGIN_NAME .. ": (access) [#" .. strategy .. "]", function()    local client
 
     lazy_setup(function()
       local bp = helpers.get_db_utils(strategy == "off" and "postgres" or strategy, nil, { PLUGIN_NAME })
@@ -578,7 +577,7 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
         local json = cjson.decode(body)
 
         -- check this is in the 'kong' response format
-        assert.equals(json.error.message, "request format not recognised")
+        assert.equals(json.error.message, "request body doesn't contain valid prompts")
       end)
     end)
 
@@ -618,9 +617,9 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
 
         -- check this is in the 'kong' response format
         assert.is_truthy(json.error)
-        assert.equals("request format not recognised", json.error.message)
+        assert.equals("request body doesn't contain valid prompts", json.error.message)
       end)
     end)
   end)
 
-end end
+end

@@ -12,8 +12,9 @@ local uuid = require("kong.tools.uuid").uuid
 local KEY_AUTH_PLUGIN
 
 
---- XXX FIXME: enable inc_sync = on
-for _, inc_sync in ipairs { "off"  } do
+for _, v in ipairs({ {"off", "off"}, {"on", "off"}, {"on", "on"}, }) do
+  local rpc, inc_sync = v[1], v[2]
+
 for _, strategy in helpers.each_strategy() do
 
 describe("CP/DP communication #" .. strategy .. " inc_sync=" .. inc_sync, function()
@@ -29,6 +30,7 @@ describe("CP/DP communication #" .. strategy .. " inc_sync=" .. inc_sync, functi
       db_update_frequency = 0.1,
       cluster_listen = "127.0.0.1:9005",
       nginx_conf = "spec/fixtures/custom_nginx.template",
+      cluster_rpc = rpc,
       cluster_incremental_sync = inc_sync,
     }))
 
@@ -41,7 +43,9 @@ describe("CP/DP communication #" .. strategy .. " inc_sync=" .. inc_sync, functi
       cluster_control_plane = "127.0.0.1:9005",
       proxy_listen = "0.0.0.0:9002",
       nginx_conf = "spec/fixtures/custom_nginx.template",
+      cluster_rpc = rpc,
       cluster_incremental_sync = inc_sync,
+      worker_state_update_frequency = 1,
     }))
 
     for _, plugin in ipairs(helpers.get_plugins_list()) do
@@ -256,26 +260,22 @@ describe("CP/DP communication #" .. strategy .. " inc_sync=" .. inc_sync, functi
         headers = {["Content-Type"] = "application/json"}
       }))
       assert.res_status(200, res)
-      -- as this is testing a negative behavior, there is no sure way to wait
-      -- this can probably be optimizted
-      ngx.sleep(2)
 
-      local proxy_client = helpers.http_client("127.0.0.1", 9002)
+      helpers.wait_until(function()
+        local proxy_client = helpers.http_client("127.0.0.1", 9002)
 
-      -- test route again
-      res = assert(proxy_client:send({
-        method  = "GET",
-        path    = "/soon-to-be-disabled",
-      }))
+        -- test route again
+        res = assert(proxy_client:send({
+          method  = "GET",
+          path    = "/soon-to-be-disabled",
+        }))
 
-      if inc_sync == "on" then
-        -- XXX incremental sync does not skip_disabled_services by default
-        assert.res_status(200, res)
-      else
-        assert.res_status(404, res)
-      end
-
-      proxy_client:close()
+        local status = res and res.status
+        proxy_client:close()
+        if status == 404 then
+          return true
+        end
+      end)
     end)
 
     it('does not sync plugins on a route attached to a disabled service', function()
@@ -348,7 +348,7 @@ describe("CP/DP communication #" .. strategy .. " inc_sync=" .. inc_sync, functi
   end)
 end)
 
-describe("CP/DP #version check #" .. strategy, function()
+describe("CP/DP #version check #" .. strategy .. " inc_sync=" .. inc_sync, function()
   -- for these tests, we do not need a real DP, but rather use the fake DP
   -- client so we can mock various values (e.g. node_version)
   describe("relaxed compatibility check:", function()
@@ -367,6 +367,7 @@ describe("CP/DP #version check #" .. strategy, function()
         cluster_listen = "127.0.0.1:9005",
         nginx_conf = "spec/fixtures/custom_nginx.template",
         cluster_version_check = "major_minor",
+        cluster_rpc = rpc,
         cluster_incremental_sync = inc_sync,
       }))
 
@@ -624,7 +625,7 @@ describe("CP/DP #version check #" .. strategy, function()
   end)
 end)
 
-describe("CP/DP config sync #" .. strategy, function()
+describe("CP/DP config sync #" .. strategy .. " inc_sync=" .. inc_sync, function()
   lazy_setup(function()
     helpers.get_db_utils(strategy) -- runs migrations
 
@@ -635,6 +636,7 @@ describe("CP/DP config sync #" .. strategy, function()
       database = strategy,
       db_update_frequency = 3,
       cluster_listen = "127.0.0.1:9005",
+      cluster_rpc = rpc,
       cluster_incremental_sync = inc_sync,
     }))
 
@@ -647,6 +649,8 @@ describe("CP/DP config sync #" .. strategy, function()
       cluster_control_plane = "127.0.0.1:9005",
       proxy_listen = "0.0.0.0:9002",
       cluster_incremental_sync = inc_sync,
+      cluster_rpc = rpc,
+      worker_state_update_frequency = 1,
     }))
   end)
 
@@ -749,6 +753,7 @@ describe("CP/DP labels #" .. strategy, function()
       db_update_frequency = 0.1,
       cluster_listen = "127.0.0.1:9005",
       nginx_conf = "spec/fixtures/custom_nginx.template",
+      cluster_rpc = rpc,
       cluster_incremental_sync = inc_sync,
     }))
 
@@ -762,6 +767,7 @@ describe("CP/DP labels #" .. strategy, function()
       proxy_listen = "0.0.0.0:9002",
       nginx_conf = "spec/fixtures/custom_nginx.template",
       cluster_dp_labels="deployment:mycloud,region:us-east-1",
+      cluster_rpc = rpc,
       cluster_incremental_sync = inc_sync,
     }))
   end)
@@ -773,12 +779,12 @@ describe("CP/DP labels #" .. strategy, function()
 
   describe("status API", function()
     it("shows DP status", function()
-      helpers.wait_until(function()
-        local admin_client = helpers.admin_client()
-        finally(function()
-          admin_client:close()
-        end)
+      local admin_client = helpers.admin_client()
+      finally(function()
+        admin_client:close()
+      end)
 
+      helpers.wait_until(function()
         local res = assert(admin_client:get("/clustering/data-planes"))
         local body = assert.res_status(200, res)
         local json = cjson.decode(body)
@@ -789,8 +795,12 @@ describe("CP/DP labels #" .. strategy, function()
             assert.matches("^(%d+%.%d+)%.%d+", v.version)
             assert.equal(CLUSTERING_SYNC_STATUS.NORMAL, v.sync_status)
             assert.equal(CLUSTERING_SYNC_STATUS.NORMAL, v.sync_status)
-            assert.equal("mycloud", v.labels.deployment)
-            assert.equal("us-east-1", v.labels.region)
+            -- TODO: The API output does include labels and certs when the
+            --       incremental sync is enabled.
+            if inc_sync == "off" then
+              assert.equal("mycloud", v.labels.deployment)
+              assert.equal("us-east-1", v.labels.region)
+            end
             return true
           end
         end
@@ -811,6 +821,7 @@ describe("CP/DP cert details(cluster_mtls = shared) #" .. strategy, function()
       db_update_frequency = 0.1,
       cluster_listen = "127.0.0.1:9005",
       nginx_conf = "spec/fixtures/custom_nginx.template",
+      cluster_rpc = rpc,
       cluster_incremental_sync = inc_sync,
     }))
 
@@ -824,6 +835,7 @@ describe("CP/DP cert details(cluster_mtls = shared) #" .. strategy, function()
       proxy_listen = "0.0.0.0:9002",
       nginx_conf = "spec/fixtures/custom_nginx.template",
       cluster_dp_labels="deployment:mycloud,region:us-east-1",
+      cluster_rpc = rpc,
       cluster_incremental_sync = inc_sync,
     }))
   end)
@@ -847,7 +859,11 @@ describe("CP/DP cert details(cluster_mtls = shared) #" .. strategy, function()
 
         for _, v in pairs(json.data) do
           if v.ip == "127.0.0.1" then
-            assert.equal(1888983905, v.cert_details.expiry_timestamp)
+            -- TODO: The API output does include labels and certs when the
+            --       incremental sync is enabled.
+            if inc_sync == "off" then
+              assert.equal(1888983905, v.cert_details.expiry_timestamp)
+            end
             return true
           end
         end
@@ -871,6 +887,7 @@ describe("CP/DP cert details(cluster_mtls = pki) #" .. strategy, function()
       -- additional attributes for PKI:
       cluster_mtls = "pki",
       cluster_ca_cert = "spec/fixtures/kong_clustering_ca.crt",
+      cluster_rpc = rpc,
       cluster_incremental_sync = inc_sync,
     }))
 
@@ -887,6 +904,7 @@ describe("CP/DP cert details(cluster_mtls = pki) #" .. strategy, function()
       cluster_mtls = "pki",
       cluster_server_name = "kong_clustering",
       cluster_ca_cert = "spec/fixtures/kong_clustering.crt",
+      cluster_rpc = rpc,
       cluster_incremental_sync = inc_sync,
     }))
   end)
@@ -910,7 +928,11 @@ describe("CP/DP cert details(cluster_mtls = pki) #" .. strategy, function()
 
         for _, v in pairs(json.data) do
           if v.ip == "127.0.0.1" then
-            assert.equal(1897136778, v.cert_details.expiry_timestamp)
+            -- TODO: The API output does include labels and certs when the
+            --       incremental sync is enabled.
+            if inc_sync == "off" then
+              assert.equal(1897136778, v.cert_details.expiry_timestamp)
+            end
             return true
           end
         end

@@ -1,8 +1,7 @@
 local typedefs = require "kong.db.schema.typedefs"
 local reserved_words = require "kong.plugins.acme.reserved_words"
 local redis_schema = require "kong.tools.redis.schema"
-
-local tablex = require "pl.tablex"
+local shallow_copy = require("kong.tools.table").shallow_copy
 
 local CERT_TYPES = { "rsa", "ecc" }
 
@@ -82,7 +81,7 @@ local LEGACY_SCHEMA_TRANSLATIONS = {
   }},
 }
 
-local REDIS_STORAGE_SCHEMA = tablex.copy(redis_schema.config_schema.fields)
+local REDIS_STORAGE_SCHEMA = shallow_copy(redis_schema.config_schema.fields)
 table.insert(REDIS_STORAGE_SCHEMA, { extra_options = {
   description = "Custom ACME Redis options",
   type = "record",
@@ -190,7 +189,7 @@ local schema = {
           -- Kong doesn't support multiple certificate chains yet
           {
             cert_type = {
-              description = "The certificate type to create. The possible values are `'rsa'` for RSA certificate or `'ecc'` for EC certificate.",
+              description = "The certificate type to create. The possible values are `rsa` for RSA certificate or `ecc` for EC certificate.",
               type = "string",
               default = 'rsa',
               one_of = CERT_TYPES,
@@ -228,7 +227,7 @@ local schema = {
           },
           {
             storage = {
-              description = "The backend storage type to use. The possible values are `'kong'`, `'shm'`, `'redis'`, `'consul'`, or `'vault'`. In DB-less mode, `'kong'` storage is unavailable. Note that `'shm'` storage does not persist during Kong restarts and does not work for Kong running on different machines, so consider using one of `'kong'`, `'redis'`, `'consul'`, or `'vault'` in production. Please refer to the Hybrid Mode sections below as well.",
+              description = "The backend storage type to use. In DB-less mode and Konnect, `kong` storage is unavailable. In hybrid mode and Konnect, `shm` storage is unavailable. `shm` storage does not persist during Kong restarts and does not work for Kong running on different machines, so consider using one of `kong`, `redis`, `consul`, or `vault` in production.",
               type = "string",
               default = "shm",
               one_of = STORAGE_TYPES,

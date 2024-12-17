@@ -1,14 +1,61 @@
 local helpers = require "spec.helpers"
 local cjson = require "cjson.safe"
 local pl_file = require "pl.file"
+local strip = require("kong.tools.string").strip
 
 local http = require("resty.http")
 
 local PLUGIN_NAME = "ai-proxy"
 local MOCK_PORT = helpers.get_available_port()
 
-for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
-  describe(PLUGIN_NAME .. ": (access) [#" .. strategy .. "]", function()
+local FILE_LOG_PATH_WITH_PAYLOADS = os.tmpname()
+
+local _EXPECTED_CHAT_STATS = {
+  meta = {
+    plugin_id = '6e7c40f6-ce96-48e4-a366-d109c169e444',
+    provider_name = 'openai',
+    request_model = 'gpt-3.5-turbo',
+    response_model = 'gpt-3.5-turbo',
+    llm_latency = 1
+  },
+  usage = {
+    prompt_tokens = 18,
+    completion_tokens = 13, -- this was from estimation
+    total_tokens = 31,
+    time_per_token = 1,
+    cost = 0.00031,
+  },
+}
+
+local truncate_file = function(path)
+  local file = io.open(path, "w")
+  file:close()
+end
+
+local function wait_for_json_log_entry(FILE_LOG_PATH)
+  local json
+
+  assert
+    .with_timeout(10)
+    .ignore_exceptions(true)
+    .eventually(function()
+      local data = assert(pl_file.read(FILE_LOG_PATH))
+
+      data = strip(data)
+      assert(#data > 0, "log file is empty")
+
+      data = data:match("%b{}")
+      assert(data, "log file does not contain JSON")
+
+      json = cjson.decode(data)
+    end)
+    .has_no_error("log file contains a valid JSON entry")
+
+  return json
+end
+
+for _, strategy in helpers.all_strategies() do
+  describe(PLUGIN_NAME .. ": (access) [#" .. strategy  .. "]", function()
     local client
 
     lazy_setup(function()
@@ -330,7 +377,9 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
             options = {
               max_tokens = 256,
               temperature = 1.0,
-              upstream_url = "http://"..helpers.mock_upstream_host..":"..MOCK_PORT.."/openai/llm/v1/chat/good"
+              upstream_url = "http://"..helpers.mock_upstream_host..":"..MOCK_PORT.."/openai/llm/v1/chat/good",
+              input_cost = 10.0,
+              output_cost = 10.0,
             },
           },
         },
@@ -353,6 +402,7 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
       })
       bp.plugins:insert {
         name = PLUGIN_NAME,
+        id = "6e7c40f6-ce96-48e4-a366-d109c169e444",
         route = { id = openai_chat_partial.id },
         config = {
           route_type = "llm/v1/chat",
@@ -360,15 +410,28 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
             header_name = "Authorization",
             header_value = "Bearer openai-key",
           },
+          logging = {
+            log_payloads = true,
+            log_statistics = true,
+          },
           model = {
             name = "gpt-3.5-turbo",
             provider = "openai",
             options = {
               max_tokens = 256,
               temperature = 1.0,
-              upstream_url = "http://"..helpers.mock_upstream_host..":"..MOCK_PORT.."/openai/llm/v1/chat/partial"
+              upstream_url = "http://"..helpers.mock_upstream_host..":"..MOCK_PORT.."/openai/llm/v1/chat/partial",
+              input_cost = 10.0,
+              output_cost = 10.0,
             },
           },
+        },
+      }
+      bp.plugins:insert {
+        name = "file-log",
+        route = { id = openai_chat_partial.id },
+        config = {
+          path = FILE_LOG_PATH_WITH_PAYLOADS,
         },
       }
       --
@@ -395,7 +458,9 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
             options = {
               max_tokens = 256,
               temperature = 1.0,
-              upstream_url = "http://"..helpers.mock_upstream_host..":"..MOCK_PORT.."/cohere/llm/v1/chat/good"
+              upstream_url = "http://"..helpers.mock_upstream_host..":"..MOCK_PORT.."/cohere/llm/v1/chat/good",
+              input_cost = 10.0,
+              output_cost = 10.0,
             },
           },
         },
@@ -433,6 +498,8 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
               temperature = 1.0,
               upstream_url = "http://"..helpers.mock_upstream_host..":"..MOCK_PORT.."/anthropic/llm/v1/chat/good",
               anthropic_version = "2023-06-01",
+              input_cost = 10.0,
+              output_cost = 10.0,
             },
           },
         },
@@ -468,7 +535,9 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
             options = {
               max_tokens = 256,
               temperature = 1.0,
-              upstream_url = "http://"..helpers.mock_upstream_host..":"..MOCK_PORT.."/openai/llm/v1/chat/bad"
+              upstream_url = "http://"..helpers.mock_upstream_host..":"..MOCK_PORT.."/openai/llm/v1/chat/bad",
+              input_cost = 10.0,
+              output_cost = 10.0,
             },
           },
         },
@@ -497,10 +566,12 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
 
     lazy_teardown(function()
       helpers.stop_kong()
+      os.remove(FILE_LOG_PATH_WITH_PAYLOADS)
     end)
 
     before_each(function()
       client = helpers.proxy_client()
+      truncate_file(FILE_LOG_PATH_WITH_PAYLOADS)
     end)
 
     after_each(function()
@@ -632,6 +703,31 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
 
         assert.equal(#events, 8)
         assert.equal(buf:tostring(), "The answer to 1 + 1 is 2.")
+
+        -- test analytics on this item
+        local log_message = wait_for_json_log_entry(FILE_LOG_PATH_WITH_PAYLOADS)
+        assert.same("127.0.0.1", log_message.client_ip)
+        assert.is_number(log_message.request.size)
+        assert.is_number(log_message.response.size)
+
+        local actual_stats = log_message.ai.proxy
+
+        local actual_llm_latency = actual_stats.meta.llm_latency
+        local actual_time_per_token = actual_stats.usage.time_per_token
+        local time_per_token = actual_llm_latency / actual_stats.usage.completion_tokens
+
+        local actual_request_log = actual_stats.payload.request or "ERROR: NONE_RETURNED"
+        local actual_response_log = actual_stats.payload.response or "ERROR: NONE_RETURNED"
+        actual_stats.payload = nil
+
+        actual_stats.meta.llm_latency = 1
+        actual_stats.usage.time_per_token = 1
+
+        assert.same(_EXPECTED_CHAT_STATS, actual_stats)
+        assert.is_true(actual_llm_latency >= 0)
+        assert.same(tonumber(string.format("%.3f", actual_time_per_token)), tonumber(string.format("%.3f", time_per_token)))
+        assert.match_re(actual_request_log, [[.*content.*What is 1 \+ 1.*]])
+        assert.match_re(actual_response_log, [[.*content.*The answer.*]])
       end)
 
       it("good stream request cohere", function()
@@ -811,4 +907,4 @@ for _, strategy in helpers.all_strategies() do if strategy ~= "cassandra" then
     end)
   end)
 
-end end
+end

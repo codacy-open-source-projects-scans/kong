@@ -1,13 +1,14 @@
 local _M = {}
 
 -- imports
-local cjson     = require("cjson.safe")
-local http      = require("resty.http")
-local fmt       = string.format
-local os        = os
-local parse_url = require("socket.url").parse
-local llm_state = require("kong.llm.state")
+local cjson      = require("cjson.safe")
+local http       = require("resty.http")
+local fmt        = string.format
+local os         = os
+local parse_url  = require("socket.url").parse
 local aws_stream = require("kong.tools.aws_stream")
+local ai_plugin_ctx = require("kong.llm.plugin.ctx")
+local ai_plugin_o11y = require("kong.llm.plugin.observability")
 --
 
 -- static
@@ -74,6 +75,13 @@ end
 
 _M._CONST = {
   ["SSE_TERMINATOR"] = "[DONE]",
+  ["AWS_STREAM_CONTENT_TYPE"] = "application/vnd.amazon.eventstream",
+}
+
+_M._SUPPORTED_STREAMING_CONTENT_TYPES = {
+  ["text/event-stream"] = true,
+  ["application/vnd.amazon.eventstream"] = true,
+  ["application/json"] = true,
 }
 
 _M.streaming_has_token_counts = {
@@ -92,7 +100,8 @@ _M.upstream_url_format = {
   gemini        = "https://generativelanguage.googleapis.com",
   gemini_vertex = "https://%s",
   bedrock       = "https://bedrock-runtime.%s.amazonaws.com",
-  mistral       = "https://api.mistral.ai:443"
+  mistral       = "https://api.mistral.ai:443",
+  huggingface   = "https://api-inference.huggingface.co/models/%s",
 }
 
 _M.operation_map = {
@@ -145,6 +154,15 @@ _M.operation_map = {
   gemini_vertex = {
     ["llm/v1/chat"] = {
       path = "/v1/projects/%s/locations/%s/publishers/google/models/%s:%s",
+    },
+  },
+  huggingface = {
+    ["llm/v1/completions"] = {
+      path = "/models/%s",
+      method = "POST",
+    },
+    ["llm/v1/chat"] = {
+      path = "/models/%s",
       method = "POST",
     },
   },
@@ -157,7 +175,7 @@ _M.operation_map = {
 }
 
 _M.clear_response_headers = {
-  shared = {
+  shared = { -- deprecared, not using
     "Content-Length",
   },
   openai = {
@@ -323,9 +341,9 @@ end
 -- as if it were an SSE message.
 --
 -- @param {string} frame input string to format into SSE events
--- @param {boolean} raw_json sets application/json byte-parser mode
+-- @param {string} content_type sets parser
 -- @return {table} n number of split SSE messages, or empty table
-function _M.frame_to_events(frame, provider)
+function _M.frame_to_events(frame, content_type)
   local events = {}
 
   if (not frame) or (#frame < 1) or (type(frame)) ~= "string" then
@@ -334,7 +352,8 @@ function _M.frame_to_events(frame, provider)
 
   -- some new LLMs return the JSON object-by-object,
   -- because that totally makes sense to parse?!
-  if provider == "gemini" then
+  local frame_start = frame and frame:sub(1, 1)
+  if frame_start == "," or frame_start == "[" then
     local done = false
 
     -- if this is the first frame, it will begin with array opener '['
@@ -360,7 +379,7 @@ function _M.frame_to_events(frame, provider)
       events[#events+1] = { data = _M._CONST.SSE_TERMINATOR }
     end
 
-  elseif provider == "bedrock" then
+  elseif content_type == _M._CONST.AWS_STREAM_CONTENT_TYPE then
     local parser = aws_stream:new(frame)
     while true do
       local msg = parser:next_message()
@@ -447,6 +466,10 @@ function _M.to_ollama(request_table, model)
   input.stream = request_table.stream or false -- for future capability
   input.model = model.name or request_table.name
 
+  -- handle function calling translation from Ollama format
+  input.tools = request_table.tools
+  input.tool_choice = request_table.tool_choice
+
   if model.options then
     input.options = {}
 
@@ -509,7 +532,7 @@ function _M.from_ollama(response_string, model_info, route_type)
       output.object = "chat.completion"
       output.choices = {
         {
-          finish_reason = stop_reason,
+          finish_reason = response_table.finish_reason or stop_reason,
           index = 0,
           message = response_table.message,
         }
@@ -550,9 +573,15 @@ function _M.conf_from_request(kong_request, source, key)
   end
 end
 
-function _M.resolve_plugin_conf(kong_request, conf)
+
+function _M.merge_model_options(kong_request, conf_m)
+  if not conf_m then
+    return
+  end
+
   local err
-  local conf_m = cycle_aware_deep_copy(conf)
+  conf_m = cycle_aware_deep_copy(conf_m)
+  conf_m.model = conf_m.model or {}
 
   -- handle model name
   local model_m = string_match(conf_m.model.name or "", '%$%((.-)%)')
@@ -576,7 +605,7 @@ function _M.resolve_plugin_conf(kong_request, conf)
   end
 
   -- handle all other options
-  for k, v in pairs(conf.model.options or {}) do
+  for k, v in pairs(conf_m.model.options or {}) do
     if type(v) == "string" then
       local prop_m = string_match(v or "", '%$%((.-)%)')
       if prop_m then
@@ -604,6 +633,7 @@ function _M.resolve_plugin_conf(kong_request, conf)
 end
 
 
+-- used by llm/init.lua:ai_introspect_body only (transformer plugins)
 function _M.pre_request(conf, request_table)
   -- process form/json body auth information
   local auth_param_name = conf.auth and conf.auth.param_name
@@ -627,22 +657,30 @@ function _M.pre_request(conf, request_table)
     kong.log.set_serialize_value(fmt("ai.%s.%s.%s", plugin_name, log_entry_keys.PAYLOAD_CONTAINER, log_entry_keys.REQUEST_BODY), kong.request.get_raw_body())
   end
 
-  -- log tokens prompt for reports and billing
-  if conf.route_type ~= "preserve" then
-    local prompt_tokens, err = _M.calculate_cost(request_table, {}, 1.0)
-    if err then
-      kong.log.warn("failed calculating cost for prompt tokens: ", err)
-      prompt_tokens = 0
-    end
-    llm_state.increase_prompt_tokens_count(prompt_tokens)
-  end
-
   local start_time_key = "ai_request_start_time_" .. plugin_name
   kong.ctx.plugin[start_time_key] = ngx.now()
 
   return true, nil
 end
 
+local function get_plugin_analytics_container(plugin_name)
+  -- check if we already have analytics in this context
+  local request_analytics = kong.ctx.shared.llm_request_analytics
+  if not request_analytics then
+    request_analytics = {}
+    kong.ctx.shared.llm_request_analytics = request_analytics
+  end
+
+  request_analytics[plugin_name] = request_analytics[plugin_name] or {
+    [log_entry_keys.META_CONTAINER] = {},
+    [log_entry_keys.USAGE_CONTAINER] = {},
+    [log_entry_keys.CACHE_CONTAINER] = {},
+  }
+
+  return request_analytics[plugin_name]
+end
+
+-- used by llm/init.lua:ai_introspect_body only (transformer plugins)
 function _M.post_request(conf, response_object)
   local body_string, err
 
@@ -664,46 +702,34 @@ function _M.post_request(conf, response_object)
     body_string = response_object.response or "ERROR__NOT_SET"
   end
 
-  -- analytics and logging
-  local provider_name = conf.model.provider
-
   local plugin_name = conf.__key__:match('plugins:(.-):')
   if not plugin_name or plugin_name == "" then
     return nil, "no plugin name is being passed by the plugin"
   end
 
-  -- check if we already have analytics in this context
-  local request_analytics = llm_state.get_request_analytics()
+  -- create or load exsiting a analytics structure for this plugin
+  local request_analytics_plugin = get_plugin_analytics_container(plugin_name)
 
-  -- create a new structure if not
-  if not request_analytics then
-    request_analytics = {}
-  end
-
-  -- create a new analytics structure for this plugin
-  local request_analytics_plugin = {
-    [log_entry_keys.META_CONTAINER] = {},
-    [log_entry_keys.USAGE_CONTAINER] = {},
-    [log_entry_keys.CACHE_CONTAINER] = {},
-  }
-
-  -- Set the model, response, and provider names in the current try context
-  request_analytics_plugin[log_entry_keys.META_CONTAINER][log_entry_keys.PLUGIN_ID] = conf.__plugin_id
-  request_analytics_plugin[log_entry_keys.META_CONTAINER][log_entry_keys.PROVIDER_NAME] = provider_name
-  request_analytics_plugin[log_entry_keys.META_CONTAINER][log_entry_keys.REQUEST_MODEL] = llm_state.get_request_model()
-  request_analytics_plugin[log_entry_keys.META_CONTAINER][log_entry_keys.RESPONSE_MODEL] = response_object.model or conf.model.name
+   -- Set meta data
+  local meta_container = request_analytics_plugin[log_entry_keys.META_CONTAINER]
+  meta_container[log_entry_keys.PLUGIN_ID] = conf.__plugin_id
+  meta_container[log_entry_keys.PROVIDER_NAME] = conf.model.provider
+  local model_t = ai_plugin_ctx.get_request_model_table_inuse()
+  meta_container[log_entry_keys.REQUEST_MODEL] = model_t and model_t.name or "UNSPECIFIED"
+  meta_container[log_entry_keys.RESPONSE_MODEL] = response_object.model or conf.model.name
 
   -- Set the llm latency meta, and time per token usage
   local start_time_key = "ai_request_start_time_" .. plugin_name
   if kong.ctx.plugin[start_time_key] then
     local llm_latency = math.floor((ngx.now() - kong.ctx.plugin[start_time_key]) * 1000)
-    request_analytics_plugin[log_entry_keys.META_CONTAINER][log_entry_keys.LLM_LATENCY] = llm_latency
-    llm_state.set_metrics("e2e_latency", llm_latency)
+    meta_container[log_entry_keys.LLM_LATENCY] = llm_latency
 
     if response_object.usage and response_object.usage.completion_tokens then
-      local time_per_token = math.floor(llm_latency / response_object.usage.completion_tokens)
+      local time_per_token = 0
+      if response_object.usage.completion_tokens > 0 then
+        time_per_token  = math.floor(llm_latency / response_object.usage.completion_tokens)
+      end
       request_analytics_plugin[log_entry_keys.USAGE_CONTAINER][log_entry_keys.TIME_PER_TOKEN] = time_per_token
-      llm_state.set_metrics("tpot_latency", time_per_token)
     end
   end
 
@@ -726,12 +752,26 @@ function _M.post_request(conf, response_object)
       request_analytics_plugin[log_entry_keys.USAGE_CONTAINER][log_entry_keys.TOTAL_TOKENS] = response_object.usage.total_tokens
     end
 
-    if response_object.usage.prompt_tokens and response_object.usage.completion_tokens
-      and conf.model.options and conf.model.options.input_cost and conf.model.options.output_cost then 
-        request_analytics_plugin[log_entry_keys.USAGE_CONTAINER][log_entry_keys.COST] = 
-          (response_object.usage.prompt_tokens * conf.model.options.input_cost
-          + response_object.usage.completion_tokens * conf.model.options.output_cost) / 1000000 -- 1 million
+    ai_plugin_o11y.metrics_set("llm_prompt_tokens_count", response_object.usage.prompt_tokens)
+    ai_plugin_o11y.metrics_set("llm_completion_tokens_count", response_object.usage.completion_tokens)
+
+    if response_object.usage.prompt_tokens and response_object.usage.completion_tokens and
+       conf.model.options and conf.model.options.input_cost and conf.model.options.output_cost then
+        local cost = (response_object.usage.prompt_tokens * conf.model.options.input_cost +
+                      response_object.usage.completion_tokens * conf.model.options.output_cost) / 1000000 -- 1 million
+        request_analytics_plugin[log_entry_keys.USAGE_CONTAINER][log_entry_keys.COST] = cost
+        ai_plugin_o11y.metrics_set("llm_usage_cost", cost)
     end
+
+  else
+    -- log tokens response for reports and billing
+    local response_tokens, err = _M.calculate_cost(response_object, {}, 1.0)
+    if err then
+      kong.log.warn("failed calculating cost for response tokens: ", err)
+      response_tokens = 0
+    end
+
+    ai_plugin_o11y.metrics_set("llm_completion_tokens_count", response_tokens)
   end
 
   -- Log response body if logging payloads is enabled
@@ -743,8 +783,6 @@ function _M.post_request(conf, response_object)
   request_analytics_plugin[log_entry_keys.PAYLOAD_CONTAINER] = {
     [log_entry_keys.RESPONSE_BODY] = body_string,
   }
-  request_analytics[plugin_name] = request_analytics_plugin
-  llm_state.set_request_analytics(request_analytics)
 
   if conf.logging and conf.logging.log_statistics then
     -- Log meta data
@@ -760,16 +798,9 @@ function _M.post_request(conf, response_object)
       request_analytics_plugin[log_entry_keys.CACHE_CONTAINER])
   end
 
-  -- log tokens response for reports and billing
-  local response_tokens, err = _M.calculate_cost(response_object, {}, 1.0)
-  if err then
-    kong.log.warn("failed calculating cost for response tokens: ", err)
-    response_tokens = 0
-  end
-  llm_state.increase_response_tokens_count(response_tokens)
-
-  return nil
+  return true
 end
+
 
 function _M.http_request(url, body, method, headers, http_opts, buffered)
   local httpc = http.new()

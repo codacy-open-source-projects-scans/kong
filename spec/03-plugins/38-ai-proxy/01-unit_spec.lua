@@ -37,6 +37,24 @@ local SAMPLE_LLM_V1_CHAT_WITH_SOME_OPTS = {
   another_extra_param = 0.5,
 }
 
+local SAMPLE_LLM_V1_CHAT_WITH_GUARDRAILS = {
+  messages = {
+    [1] = {
+      role = "system",
+      content = "You are a mathematician."
+    },
+    [2] = {
+      role = "assistant",
+      content = "What is 1 + 1?"
+    },
+  },
+  guardrailConfig = {
+    guardrailIdentifier = "yu5xwvfp4sud",
+    guardrailVersion = "1",
+    trace = "enabled",
+  },
+}
+
 local SAMPLE_DOUBLE_FORMAT = {
   messages = {
     [1] = {
@@ -49,6 +67,80 @@ local SAMPLE_DOUBLE_FORMAT = {
     },
   },
   prompt = "Hi world",
+}
+
+local SAMPLE_OPENAI_TOOLS_REQUEST = {
+  messages = {
+    [1] = {
+      role = "user",
+      content = "Is the NewPhone in stock?"
+    },
+  },
+  tools = {
+    [1] = {
+      ['function'] = {
+        parameters = {
+          ['type'] = "object",
+          properties = {
+            product_name = {
+              ['type'] = "string",
+            },
+          },
+          required = {
+            "product_name",
+          },
+        },
+        name = "check_stock",
+        description = "Check a product is in stock."
+      },
+      ['type'] = "function",
+    },
+  },
+}
+
+local SAMPLE_GEMINI_TOOLS_RESPONSE = {
+  candidates = { {
+    content = {
+      role = "model",
+      parts = { {
+        functionCall = {
+          name = "sql_execute",
+          args = {
+            product_name = "NewPhone"
+          }
+        }
+      } }
+    },
+    finishReason = "STOP",
+  } },
+}
+
+local SAMPLE_BEDROCK_TOOLS_RESPONSE = {
+  metrics = {
+    latencyMs = 3781
+  },
+  output = {
+    message = {
+      content = { {
+        text = "Certainly! To calculate the sum of 121, 212, and 313, we can use the \"sumArea\" function that's available to us."
+      }, {
+        toolUse = {
+          input = {
+            areas = { 121, 212, 313 }
+          },
+          name = "sumArea",
+          toolUseId = "tooluse_4ZakZPY9SiWoKWrAsY7_eg"
+        }
+      } },
+      role = "assistant"
+    }
+  },
+  stopReason = "tool_use",
+  usage = {
+    inputTokens = 410,
+    outputTokens = 115,
+    totalTokens = 525
+  }
 }
 
 local FORMATS = {
@@ -345,7 +437,7 @@ describe(PLUGIN_NAME .. ": (unit)", function()
       },
     }
 
-    local result, err = ai_shared.resolve_plugin_conf(fake_request, fake_config)
+    local result, err = ai_shared.merge_model_options(fake_request, fake_config)
     assert.is_falsy(err)
     assert.same(result.model.options, {
       ['azure_api_version'] = 'arg_value_here_1',
@@ -403,7 +495,7 @@ describe(PLUGIN_NAME .. ": (unit)", function()
       },
     }
 
-    local result, err = ai_shared.resolve_plugin_conf(fake_request, fake_config)
+    local result, err = ai_shared.merge_model_options(fake_request, fake_config)
     assert.is_falsy(err)
     assert.same("cap_value_here_2", result.model.name)
   end)
@@ -455,7 +547,7 @@ describe(PLUGIN_NAME .. ": (unit)", function()
       },
     }
 
-    local _, err = ai_shared.resolve_plugin_conf(fake_request, fake_config)
+    local _, err = ai_shared.merge_model_options(fake_request, fake_config)
     assert.same("uri_captures key uri_cap_3 was not provided", err)
   end)
 
@@ -698,7 +790,7 @@ describe(PLUGIN_NAME .. ": (unit)", function()
 
     it("transforms complete-json type", function()
       local input = pl_file.read(fmt("spec/fixtures/ai-proxy/unit/streaming-chunk-formats/complete-json/input.bin"))
-      local events = ai_shared.frame_to_events(input, "cohere")  -- not "truncated json mode" like Gemini
+      local events = ai_shared.frame_to_events(input, "text/event-stream")  -- not "truncated json mode" like Gemini
 
       local expected = pl_file.read(fmt("spec/fixtures/ai-proxy/unit/streaming-chunk-formats/complete-json/expected-output.json"))
       local expected_events = cjson.decode(expected)
@@ -708,7 +800,7 @@ describe(PLUGIN_NAME .. ": (unit)", function()
 
     it("transforms text/event-stream type", function()
       local input = pl_file.read(fmt("spec/fixtures/ai-proxy/unit/streaming-chunk-formats/text-event-stream/input.bin"))
-      local events = ai_shared.frame_to_events(input, "openai")  -- not "truncated json mode" like Gemini
+      local events = ai_shared.frame_to_events(input, "text/event-stream")  -- not "truncated json mode" like Gemini
 
       local expected = pl_file.read(fmt("spec/fixtures/ai-proxy/unit/streaming-chunk-formats/text-event-stream/expected-output.json"))
       local expected_events = cjson.decode(expected)
@@ -718,7 +810,7 @@ describe(PLUGIN_NAME .. ": (unit)", function()
 
     it("transforms application/vnd.amazon.eventstream (AWS) type", function()
       local input = pl_file.read(fmt("spec/fixtures/ai-proxy/unit/streaming-chunk-formats/aws/input.bin"))
-      local events = ai_shared.frame_to_events(input, "bedrock")
+      local events = ai_shared.frame_to_events(input, "application/vnd.amazon.eventstream")
 
       local expected = pl_file.read(fmt("spec/fixtures/ai-proxy/unit/streaming-chunk-formats/aws/expected-output.json"))
       local expected_events = cjson.decode(expected)
@@ -775,4 +867,149 @@ describe(PLUGIN_NAME .. ": (unit)", function()
     end)
   end)
 
+  describe("gemini tools", function()
+    local gemini_driver
+
+    setup(function()
+      _G._TEST = true
+      package.loaded["kong.llm.drivers.gemini"] = nil
+      gemini_driver = require("kong.llm.drivers.gemini")
+    end)
+  
+    teardown(function()
+      _G._TEST = nil
+    end)
+
+    it("transforms openai tools to gemini tools GOOD", function()
+      local gemini_tools = gemini_driver._to_tools(SAMPLE_OPENAI_TOOLS_REQUEST.tools)
+
+      assert.not_nil(gemini_tools)
+      assert.same(gemini_tools, {
+        {
+          function_declarations = {
+            {
+              description = "Check a product is in stock.",
+              name = "check_stock",
+              parameters = {
+                properties = {
+                  product_name = {
+                    type = "string"
+                  }
+                },
+                required = {
+                  "product_name"
+                },
+                type = "object"
+              }
+            }
+          }
+        }
+      })
+    end)
+
+    it("transforms openai tools to gemini tools NO_TOOLS", function()
+      local gemini_tools = gemini_driver._to_tools(SAMPLE_LLM_V1_CHAT)
+
+      assert.is_nil(gemini_tools)
+    end)
+
+    it("transforms openai tools to gemini tools NIL", function()
+      local gemini_tools = gemini_driver._to_tools(nil)
+
+      assert.is_nil(gemini_tools)
+    end)
+
+    it("transforms gemini tools to openai tools GOOD", function()
+      local openai_tools = gemini_driver._from_gemini_chat_openai(SAMPLE_GEMINI_TOOLS_RESPONSE, {}, "llm/v1/chat")
+
+      assert.not_nil(openai_tools)
+
+      openai_tools = cjson.decode(openai_tools)
+      assert.same(openai_tools.choices[1].message.tool_calls[1]['function'], {
+        name = "sql_execute",
+        arguments = "{\"product_name\":\"NewPhone\"}"
+      })
+    end)
+  end)
+
+  describe("bedrock tools", function()
+    local bedrock_driver
+
+    setup(function()
+      _G._TEST = true
+      package.loaded["kong.llm.drivers.bedrock"] = nil
+      bedrock_driver = require("kong.llm.drivers.bedrock")
+    end)
+  
+    teardown(function()
+      _G._TEST = nil
+    end)
+
+    it("transforms openai tools to bedrock tools GOOD", function()
+      local bedrock_tools = bedrock_driver._to_tools(SAMPLE_OPENAI_TOOLS_REQUEST.tools)
+
+      assert.not_nil(bedrock_tools)
+      assert.same(bedrock_tools, {
+        {
+          toolSpec = {
+            description = "Check a product is in stock.",
+            inputSchema = {
+              json = {
+                properties = {
+                  product_name = {
+                    type = "string"
+                  }
+                },
+                required = {
+                  "product_name"
+                },
+                type = "object"
+              }
+            },
+            name = "check_stock"
+          }
+        }
+      })
+    end)
+
+    it("transforms openai tools to bedrock tools NO_TOOLS", function()
+      local bedrock_tools = bedrock_driver._to_tools(SAMPLE_LLM_V1_CHAT)
+
+      assert.is_nil(bedrock_tools)
+    end)
+
+    it("transforms openai tools to bedrock tools NIL", function()
+      local bedrock_tools = bedrock_driver._to_tools(nil)
+
+      assert.is_nil(bedrock_tools)
+    end)
+
+    it("transforms bedrock tools to openai tools GOOD", function()
+      local openai_tools = bedrock_driver._from_tool_call_response(SAMPLE_BEDROCK_TOOLS_RESPONSE.output.message.content)
+
+      assert.not_nil(openai_tools)
+
+      assert.same(openai_tools[1]['function'], {
+        name = "sumArea",
+        arguments = "{\"areas\":[121,212,313]}"
+      })
+    end)
+
+    it("transforms guardrails into bedrock generation config", function()
+      local model_info = {
+        route_type = "llm/v1/chat",
+        name = "some-model",
+        provider = "bedrock",
+      }
+      local bedrock_guardrails = bedrock_driver._to_bedrock_chat_openai(SAMPLE_LLM_V1_CHAT_WITH_GUARDRAILS, model_info, "llm/v1/chat")
+
+      assert.not_nil(bedrock_guardrails)
+
+      assert.same(bedrock_guardrails.guardrailConfig, {
+        ['guardrailIdentifier'] = 'yu5xwvfp4sud',
+        ['guardrailVersion'] = '1',
+        ['trace'] = 'enabled',
+      })
+    end)
+  end)
 end)

@@ -8,12 +8,12 @@ local buffer = require("string.buffer")
 
 local string_format = string.format
 local cjson_encode = cjson.encode
+local ngx_null = ngx.null
 local ngx_log = ngx.log
 local ngx_ERR = ngx.ERR
-local ngx_DEBUG = ngx.DEBUG
 
 
-local CLEANUP_VERSION_COUNT = 100
+local KEEP_VERSION_COUNT = 100
 local CLEANUP_TIME_DELAY = 3600  -- 1 hour
 
 
@@ -38,12 +38,10 @@ local PURGE_QUERY = [[
 function _M:init_worker()
   local function cleanup_handler(premature)
     if premature then
-      ngx_log(ngx_DEBUG, "[incremental] worker exiting, killing incremental cleanup timer")
-
       return
     end
 
-    local res, err = self.connector:query(string_format(PURGE_QUERY, CLEANUP_VERSION_COUNT))
+    local res, err = self.connector:query(string_format(PURGE_QUERY, KEEP_VERSION_COUNT))
     if not res then
       ngx_log(ngx_ERR,
               "[incremental] unable to purge old data from incremental delta table, err: ",
@@ -51,9 +49,6 @@ function _M:init_worker()
 
       return
     end
-
-    ngx_log(ngx_DEBUG,
-            "[incremental] successfully purged old data from incremental delta table")
   end
 
   assert(ngx.timer.every(CLEANUP_TIME_DELAY, cleanup_handler))
@@ -66,23 +61,32 @@ local NEW_VERSION_QUERY = [[
     new_version integer;
   BEGIN
     INSERT INTO clustering_sync_version DEFAULT VALUES RETURNING version INTO new_version;
-    INSERT INTO clustering_sync_delta (version, type, id, ws_id, row) VALUES %s;
+    INSERT INTO clustering_sync_delta (version, type, pk, ws_id, entity) VALUES %s;
   END $$;
 ]]
 
 
 -- deltas: {
---   { type = "service", "id" = "d78eb00f-8702-4d6a-bfd9-e005f904ae3e", "ws_id" = "73478cf6-964f-412d-b1c4-8ac88d9e85e9", row = "JSON", }
---   { type = "route", "id" = "0a5bac5c-b795-4981-95d2-919ba3390b7e", "ws_id" = "73478cf6-964f-412d-b1c4-8ac88d9e85e9", row = "JSON", }
+--   { type = "service", "pk" = { id = "d78eb00f..." }, "ws_id" = "73478cf6...", entity = "JSON", }
+--   { type = "route", "pk" = { id = "0a5bac5c..." }, "ws_id" = "73478cf6...", entity = "JSON", }
 -- }
 function _M:insert_delta(deltas)
   local buf = buffer.new()
-  for _, d in ipairs(deltas) do
+
+  local count = #deltas
+  for i = 1, count do
+    local d = deltas[i]
+
     buf:putf("(new_version, %s, %s, %s, %s)",
              self.connector:escape_literal(d.type),
-             self.connector:escape_literal(d.id),
-             self.connector:escape_literal(d.ws_id),
-             self.connector:escape_literal(cjson_encode(d.row)))
+             self.connector:escape_literal(cjson_encode(d.pk)),
+             self.connector:escape_literal(d.ws_id or kong.default_workspace),
+             self.connector:escape_literal(cjson_encode(d.entity)))
+
+    -- sql values should be separated by comma
+    if i < count then
+      buf:put(",")
+    end
   end
 
   local sql = string_format(NEW_VERSION_QUERY, buf:get())
@@ -92,14 +96,19 @@ end
 
 
 function _M:get_latest_version()
-  local sql = "SELECT MAX(version) AS max_version FROM clustering_sync_version"
+  local sql = "SELECT MAX(version) FROM clustering_sync_version"
 
-  local res, err = self.connector:query(sql)
+  local res, err = self.connector:query(sql, "read")
   if not res then
     return nil, err
   end
 
-  return res[1] and res[1].max_version
+  local ver = res[1] and res[1].max
+  if ver == ngx_null then
+    return 0
+  end
+
+  return ver
 end
 
 

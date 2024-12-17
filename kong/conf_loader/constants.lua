@@ -84,6 +84,9 @@ local DEFAULT_PATHS = {
 }
 
 
+local DEFAULT_PLUGINSERVER_PATH = "/usr/local/bin"
+
+
 local HEADER_KEY_TO_NAME = {
   ["server_tokens"] = "server_tokens",
   ["latency_tokens"] = "latency_tokens",
@@ -511,6 +514,7 @@ local CONF_PARSERS = {
   cluster_dp_labels = { typ = "array" },
   cluster_rpc = { typ = "boolean" },
   cluster_incremental_sync = { typ = "boolean" },
+  cluster_full_sync_threshold = { typ = "number" },
   cluster_cjson = { typ = "boolean" },
 
   kic = { typ = "boolean" },
@@ -588,6 +592,7 @@ local CONF_SENSITIVE = {
   admin_gui_ssl_cert_key = true,
   status_ssl_cert_key = true,
   debug_ssl_cert_key = true,
+  ["$refs"] = true, -- for internal use only, no need to log
 }
 
 
@@ -643,6 +648,7 @@ return {
 
   CIPHER_SUITES = CIPHER_SUITES,
   DEFAULT_PATHS = DEFAULT_PATHS,
+  DEFAULT_PLUGINSERVER_PATH = DEFAULT_PLUGINSERVER_PATH,
   HEADER_KEY_TO_NAME = HEADER_KEY_TO_NAME,
   UPSTREAM_HEADER_KEY_TO_NAME = UPSTREAM_HEADER_KEY_TO_NAME,
   DYNAMIC_KEY_NAMESPACES = DYNAMIC_KEY_NAMESPACES,

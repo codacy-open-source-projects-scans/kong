@@ -205,11 +205,17 @@ local function do_authentication(conf)
     return false, unauthorized("Invalid algorithm", www_authenticate_with_error)
   end
 
-  local jwt_secret_value = algorithm ~= nil and algorithm:sub(1, 2) == "HS" and
-                           jwt_secret.secret or jwt_secret.rsa_public_key
+  local is_symmetric_algorithm = algorithm ~= nil and algorithm:sub(1, 2) == "HS" 
+  local jwt_secret_value
 
-  if conf.secret_is_base64 then
-    jwt_secret_value = jwt:base64_decode(jwt_secret_value)
+  if is_symmetric_algorithm and conf.secret_is_base64 then
+    jwt_secret_value = jwt:base64_decode(jwt_secret.secret)
+  elseif is_symmetric_algorithm then
+    jwt_secret_value = jwt_secret.secret
+  else
+    -- rsa_public_key is either nil or a valid plain text pem file, it can't be base64 decoded.
+    -- see #13710
+    jwt_secret_value = jwt_secret.rsa_public_key
   end
 
   if not jwt_secret_value then
@@ -265,6 +271,12 @@ local function set_anonymous_consumer(anonymous)
                                         anonymous, true)
   if err then
     return error(err)
+  end
+
+  if not consumer then
+    local err_msg = "anonymous consumer " .. anonymous .. " is configured but doesn't exist"
+    kong.log.err(err_msg)
+    return kong.response.error(500, err_msg)
   end
 
   set_consumer(consumer)

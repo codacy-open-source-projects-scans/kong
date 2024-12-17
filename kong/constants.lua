@@ -43,6 +43,7 @@ local plugins = {
   "ai-request-transformer",
   "ai-response-transformer",
   "standard-webhooks",
+  "redirect"
 }
 
 local plugin_map = {}
@@ -233,6 +234,7 @@ local constants = {
     RELOAD           = "configuration reload failed",
     GENERIC          = "generic or unknown error",
   },
+  CLUSTERING_DATA_PLANES_LATEST_VERSION_KEY = "clustering_data_planes:latest_version",
 
   CLEAR_HEALTH_STATUS_DELAY = 300, -- 300 seconds
 
