@@ -514,7 +514,6 @@ local CONF_PARSERS = {
   cluster_dp_labels = { typ = "array" },
   cluster_rpc = { typ = "boolean" },
   cluster_rpc_sync = { typ = "boolean" },
-  cluster_full_sync_threshold = { typ = "number" },
   cluster_cjson = { typ = "boolean" },
 
   kic = { typ = "boolean" },
@@ -570,6 +569,7 @@ local CONF_PARSERS = {
   admin_gui_url = { typ = "array" },
   admin_gui_path = { typ = "string" },
   admin_gui_api_url = { typ = "string" },
+  admin_gui_csp_header = { typ = "boolean" },
 
   request_debug = { typ = "boolean" },
   request_debug_token = { typ = "string" },

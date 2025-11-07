@@ -261,6 +261,10 @@ _M.load_into_cache_with_events = declarative_import.load_into_cache_with_events
 _M.insert_entity_for_txn       = declarative_import.insert_entity_for_txn
 _M.delete_entity_for_txn       = declarative_import.delete_entity_for_txn
 _M.workspace_id                = declarative_import.workspace_id
+_M.GLOBAL_WORKSPACE_TAG        = declarative_import.GLOBAL_WORKSPACE_TAG
+
+-- helpful function
+_M.pretty_print_error          = pretty_print_error
 
 
 return _M

@@ -75,6 +75,9 @@ function prepare_container() {
     docker exec $1 apt-get install -y build-essential curl m4 unzip git
     docker exec $1 bash -c "ln -sf /usr/local/kong/include/* /usr/include"
     docker exec $1 bash -c "ln -sf /usr/local/kong/lib/* /usr/lib"
+    # the following two lines will not be needed on 3.11+
+    docker exec -u 0 $1 apt-get install -y lua5.1
+    docker cp scripts/upgrade-tests/luarocks-system-lua $1:/usr/local/bin/luarocks
 }
 
 function build_containers() {
@@ -91,6 +94,19 @@ function build_containers() {
     $COMPOSE up --wait
     prepare_container $OLD_CONTAINER
     docker exec -w /kong $OLD_CONTAINER make $old_make_target CRYPTO_DIR=/usr/local/kong
+
+    if [ -f kong-latest.rockspec ]; then
+        version=$(grep -E '^\s*(major|minor|patch)\s*=' kong/meta.lua \
+            | sed -E 's/[^0-9]*([0-9]+).*/\1/' \
+            | paste -sd. -)
+    
+        tmpfile=$(mktemp kong-rockspec.XXXX)
+        sed "s/^version *= *\".*\"/version = \"$version-0\"/" kong-latest.rockspec > "$tmpfile"
+        mv "$tmpfile" kong-latest.rockspec
+    
+        mv kong-latest.rockspec kong-$version-0.rockspec
+    fi
+
     make dev-legacy CRYPTO_DIR=/usr/local/kong
 }
 

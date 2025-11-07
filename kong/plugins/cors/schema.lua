@@ -31,7 +31,7 @@ return {
     { config = {
         type = "record",
         fields = {
-          { origins = { description = "List of allowed domains for the `Access-Control-Allow-Origin` header. If you want to allow all origins, add `*` as a single value to this configuration field. The accepted values can either be flat strings or PCRE regexes.", type = "array",
+          { origins = { description = "List of allowed domains for the `Access-Control-Allow-Origin` header. If you want to allow all origins, add `*` as a single value to this configuration field. The accepted values can either be flat strings or PCRE regexes. NOTE: If you don't specify any allowed domains, all origins are allowed.", type = "array",
               elements = {
                 type = "string",
                 custom_validator = validate_asterisk_or_regex,
@@ -48,6 +48,7 @@ return {
           { credentials = { description = "Flag to determine whether the `Access-Control-Allow-Credentials` header should be sent with `true` as the value.", type = "boolean", required = true, default = false }, },
           { private_network = { description = "Flag to determine whether the `Access-Control-Allow-Private-Network` header should be sent with `true` as the value.", type = "boolean", required = true, default = false }, },
           { preflight_continue = { description = "A boolean value that instructs the plugin to proxy the `OPTIONS` preflight request to the Upstream service.", type = "boolean", required = true, default = false }, },
+          { allow_origin_absent = { description = "A boolean value that skip cors response headers when origin header of request is empty", type = "boolean", required = true, default = true }, },
     }, }, },
   },
 }

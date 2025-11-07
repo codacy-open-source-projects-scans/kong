@@ -24,10 +24,11 @@ local log = require "kong.cmd.utils.log"
 local ffi = require "ffi"
 local bit = require "bit"
 local nginx_signals = require "kong.cmd.utils.nginx_signals"
+local admin_gui_utils = require "kong.admin_gui.utils"
 
 
 local strip = require("kong.tools.string").strip
-local split = require("kong.tools.string").split
+local isplitn = require("kong.tools.string").isplitn
 local shallow_copy = require("kong.tools.table").shallow_copy
 
 
@@ -440,7 +441,35 @@ local function compile_kong_conf(kong_config, template_env_inject)
 end
 
 local function compile_kong_gui_include_conf(kong_config)
-  return compile_conf(kong_config, kong_nginx_gui_include_template)
+  -- Build connect-src in the CSP header
+  -- Other parts are defined inside nginx_kong_gui_include.lua
+  local csp_connect_src
+  if kong_config.admin_gui_csp_header then
+    -- TODO: Try bundling buttons.js with frontend assets instead of loading it from a URL
+    csp_connect_src = { "'self'", "https://api.github.com/repos/kong/kong" }
+    if kong_config.admin_gui_api_url then
+      table.insert(csp_connect_src, kong_config.admin_gui_api_url)
+    else
+      -- If admin_gui_api_url is missing, we will add dynamic sources that echoes the requested host
+      -- with ports defined in admin_listeners corresponding to the scheme
+      local api_listen = admin_gui_utils.select_listener(kong_config.admin_listeners, { ssl = false })
+      local api_port = api_listen and api_listen.port
+      if api_port then
+        table.insert(csp_connect_src, "http://$host:" .. api_port)
+      end
+
+      local api_ssl_listen = admin_gui_utils.select_listener(kong_config.admin_listeners, { ssl = true })
+      local api_ssl_port = api_ssl_listen and api_ssl_listen.port
+      if api_ssl_port then
+        table.insert(csp_connect_src, "https://$host:" .. api_ssl_port)
+      end
+    end
+    csp_connect_src = table.concat(csp_connect_src, " ")
+  end
+
+  return compile_conf(kong_config, kong_nginx_gui_include_template, {
+    admin_gui_csp_connect_src = csp_connect_src,
+  })
 end
 
 local function compile_kong_stream_conf(kong_config, template_env_inject)
@@ -508,6 +537,12 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
     local ok, err = makepath(kong_config.socket_path)
     if not ok then
       return nil, err
+    end
+
+    local ok, _, _, stderr = pl_utils.executeex("chmod 755 " .. kong_config.socket_path)
+    if not ok then
+      return nil, "can not set correct permissions for socket path: " .. kong_config.socket_path
+                  .. " (" .. stderr .. ")"
     end
   end
 
@@ -758,9 +793,8 @@ local function prepare_prefix(kong_config, nginx_custom_template_path, skip_writ
   end
 
   local template_env = {}
-  nginx_conf_flags = nginx_conf_flags and split(nginx_conf_flags, ",") or {}
-  for _, flag in ipairs(nginx_conf_flags) do
-    template_env[flag] = true
+  for flag in isplitn(nginx_conf_flags, ",") do
+    template_env[strip(flag)] = true
   end
 
   local nginx_conf, err = compile_nginx_conf(kong_config, nginx_template)

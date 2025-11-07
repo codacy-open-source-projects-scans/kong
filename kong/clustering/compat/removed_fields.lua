@@ -228,4 +228,27 @@ return {
       "queue.concurrency_limit",
     },
   },
+
+  -- Any dataplane older than 3.10.0
+  [3010000000] = {
+    cors = {
+      "allow_origin_absent",
+    },
+    session = {
+      "hash_subject",
+      "store_metadata",
+    },
+    prometheus = {
+      "wasm_metrics",
+    },
+    ai_proxy = {
+      "llm_format",
+    },
+    ai_prompt_guard = {
+      "llm_format",
+    },
+    ai_prompt_decorator = {
+      "llm_format",
+    },
+  },
 }

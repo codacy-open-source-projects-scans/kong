@@ -6,7 +6,7 @@ local cjson = require "cjson.safe"
 local buffer = require "string.buffer"
 local checks = require "kong.pdk.private.checks"
 local phase_checker = require "kong.pdk.private.phases"
-
+local balancer = require "ngx.balancer"
 
 local ngx = ngx
 local ngx_var = ngx.var
@@ -16,6 +16,7 @@ local table_concat = table.concat
 local type = type
 local string_find = string.find
 local string_sub = string.sub
+local string_gsub = string.gsub
 local string_byte = string.byte
 local string_lower = string.lower
 local normalize_multi_header = checks.normalize_multi_header
@@ -23,7 +24,9 @@ local validate_header = checks.validate_header
 local validate_headers = checks.validate_headers
 local check_phase = phase_checker.check
 local escape = require("kong.tools.uri").escape
+local get_header = require("kong.tools.http").get_header
 local search_remove = require("resty.ada.search").remove
+local content_types = require("kong.tools.http").CONTENT_TYPES
 
 
 local PHASES = phase_checker.phases
@@ -70,13 +73,10 @@ local function new(self)
 
   local request = {}
 
-  -- TODO these constants should be shared with kong.request
-
-  local CONTENT_TYPE           = "Content-Type"
-
-  local CONTENT_TYPE_POST      = "application/x-www-form-urlencoded"
-  local CONTENT_TYPE_JSON      = "application/json"
-  local CONTENT_TYPE_FORM_DATA = "multipart/form-data"
+  local CONTENT_TYPE           = content_types.CONTENT_TYPE
+  local CONTENT_TYPE_POST      = content_types.CONTENT_TYPE_POST
+  local CONTENT_TYPE_JSON      = content_types.CONTENT_TYPE_JSON
+  local CONTENT_TYPE_FORM_DATA = content_types.CONTENT_TYPE_FORM_DATA
 
   local SLASH                  = string_byte("/")
 
@@ -110,6 +110,15 @@ local function new(self)
 
     if scheme ~= "http" and scheme ~= "https" then
       error("invalid scheme: " .. scheme, 2)
+    end
+
+    if ngx.get_phase() == "balancer" then
+      if scheme == "https" then
+        kong.service.request.enable_tls()
+      end
+      if scheme == "http" then
+        kong.service.request.disable_tls()
+      end
     end
 
     ngx_var.upstream_scheme = scheme
@@ -286,7 +295,11 @@ local function new(self)
 
     local args = ngx_var.args
     if args and args ~= "" then
-      ngx_var.args = search_remove(args, name)
+      args = search_remove(args, name)
+      if string_find(args, "+", nil, true) then
+        args = string_gsub(args, "+", "%%20")
+      end
+      ngx_var.args = args
     end
   end
 
@@ -653,7 +666,7 @@ local function new(self)
         error("mime must be a string", 2)
       end
       if not mime then
-        mime = ngx.req.get_headers()[CONTENT_TYPE]
+        mime = get_header(CONTENT_TYPE)
         if not mime then
           return nil, "content type was neither explicitly given " ..
                       "as an argument or received as a header"
@@ -710,6 +723,16 @@ local function new(self)
       check_phase(preread_and_balancer)
 
       return disable_proxy_ssl()
+    end
+  else
+    request.disable_tls = function()
+      check_phase(preread_and_balancer)
+      return balancer.set_upstream_tls(false)
+    end
+
+    request.enable_tls = function()
+      check_phase(preread_and_balancer)
+      return balancer.set_upstream_tls(true)
     end
   end
 

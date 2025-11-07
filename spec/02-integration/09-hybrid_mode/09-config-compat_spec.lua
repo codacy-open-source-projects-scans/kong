@@ -76,8 +76,9 @@ local function get_sync_status(id)
 end
 
 
--- XXX TODO: helpers.clustering_client supports rpc sync
-for _, rpc_sync in ipairs { "off"  } do
+for _, v in ipairs({ {"off", "off"}, {"on", "off"}, {"on", "on"}, }) do
+  local rpc, rpc_sync = v[1], v[2]
+
 for _, strategy in helpers.each_strategy() do
 
 describe("CP/DP config compat transformations #" .. strategy, function()
@@ -103,6 +104,7 @@ describe("CP/DP config compat transformations #" .. strategy, function()
       cluster_listen = CP_HOST .. ":" .. CP_PORT,
       nginx_conf = "spec/fixtures/custom_nginx.template",
       plugins = "bundled",
+      cluster_rpc= rpc,
       cluster_rpc_sync = rpc_sync,
     }))
   end)
@@ -201,19 +203,27 @@ describe("CP/DP config compat transformations #" .. strategy, function()
     end)
 
     describe("compatibility test for cors plugin", function()
-      it("removes `config.private_network` before sending them to older(less than 3.5.0.0) DP nodes", function()
+      it("removes config.options before sending them to older DP nodes", function()
         local cors = admin.plugins:insert {
           name = "cors",
           enabled = true,
           config = {
+            -- [[ new fields 3.10.0
+            allow_origin_absent = true,
+            -- ]]
             -- [[ new fields 3.5.0
             private_network = false
             -- ]]
           }
         }
 
-        assert.not_nil(cors.config.private_network)
+        assert.not_nil(cors.config.allow_origin_absent)
         local expected_cors = cycle_aware_deep_copy(cors)
+        do_assert(uuid(), "3.10.0", expected_cors)
+        expected_cors.config.allow_origin_absent = nil
+
+        assert.not_nil(cors.config.private_network)
+        expected_cors = cycle_aware_deep_copy(expected_cors)
         expected_cors.config.private_network = nil
         do_assert(uuid(), "3.4.0", expected_cors)
 
@@ -221,16 +231,22 @@ describe("CP/DP config compat transformations #" .. strategy, function()
         admin.plugins:remove({ id = cors.id })
       end)
 
-      it("does not remove `config.private_network` from DP nodes that are already compatible", function()
+      it("does not remove config.options from DP nodes that are already compatible", function()
         local cors = admin.plugins:insert {
           name = "cors",
           enabled = true,
           config = {
+            -- [[ new fields 3.10.0
+            allow_origin_absent = true,
+            -- ]]
             -- [[ new fields 3.5.0
             private_network = false
             -- ]]
           }
         }
+        do_assert(uuid(), "3.10.0", cors)
+        cors.config.allow_origin_absent = nil
+
         do_assert(uuid(), "3.5.0", cors)
 
         -- cleanup
@@ -602,8 +618,72 @@ describe("CP/DP config compat transformations #" .. strategy, function()
       end)
     end)
 
+    describe("compatibility tests for sesssion plugin", function ()
+      it("removes `config.store_metadata` and `config.hash_subject` before sending them to older(3.9.0.0)DP nodes", function ()
+            local session = admin.plugins:insert {
+              name = "session",
+              enabled = true,
+              config = {
+                -- [[ new fields 3.10.0
+                store_metadata = true,
+                hash_subject = true,
+                -- ]]
+              }
+            }
+
+            assert.not_nil(session.config.store_metadata)
+            assert.not_nil(session.config.hash_subject)
+            local expected_session = cycle_aware_deep_copy(session)
+            expected_session.config.store_metadata = nil
+            expected_session.config.hash_subject = nil
+            do_assert(uuid(), "3.9.0", expected_session)
+
+            -- cleanup
+            admin.plugins:remove({ id = session.id })
+      end)
+    end)
+
     describe("ai plugins supported providers", function()
       it("[ai-proxy] tries to use unsupported providers on older Kong versions", function()
+        -- [[ 3.9.x ]] --
+        local ai_proxy = admin.plugins:insert {
+          name = "ai-proxy",
+          enabled = true,
+          config = {
+            route_type = "llm/v1/chat",
+            auth = {
+              header_name = "header",
+              header_value = "value",
+            },
+            model = {
+              name = "any-model-name",
+              provider = "huggingface",
+              options = {
+                max_tokens = 512,
+                temperature = 0.5,
+                huggingface = {
+                  use_cache = true,
+                  wait_for_model = true,
+                },
+              },
+            },
+          },
+        }
+        -- ]]
+
+        local expected = cycle_aware_deep_copy(ai_proxy)
+        -- llm_format
+        expected.config.llm_format = nil
+        -- 'ai fallback' field sets
+        expected.config.route_type = "preserve"
+        expected.config.model.provider = "openai"
+        expected.config.model.options.huggingface = nil
+
+        do_assert(uuid(), "3.8.0", expected)
+
+        -- cleanup
+        admin.plugins:remove({ id = ai_proxy.id })
+
         -- [[ 3.8.x ]] --
         local ai_proxy = admin.plugins:insert {
           name = "ai-proxy",
@@ -638,6 +718,9 @@ describe("CP/DP config compat transformations #" .. strategy, function()
         -- ]]
 
         local expected = cycle_aware_deep_copy(ai_proxy)
+
+        -- llm_format
+        expected.config.llm_format = nil
 
         -- max body size
         expected.config.max_request_body_size = nil
@@ -833,6 +916,17 @@ describe("CP/DP config compat transformations #" .. strategy, function()
 
         local expected = cycle_aware_deep_copy(ai_proxy)
 
+        -- llm_format
+        expected.config.llm_format = nil
+        -- bedrock fields may not exist, so check before accessing
+        if expected.config.model.options.bedrock and type(expected.config.model.options.bedrock) == "table" then
+          expected.config.model.options.bedrock.aws_assume_role_arn = nil
+          expected.config.model.options.bedrock.aws_role_session_name = nil
+          expected.config.model.options.bedrock.aws_sts_endpoint_url = nil
+        end
+
+        do_assert(uuid(), "3.9.0", expected)
+
         -- max body size
         expected.config.max_request_body_size = nil
 
@@ -956,6 +1050,9 @@ describe("CP/DP config compat transformations #" .. strategy, function()
         expected.config.max_request_body_size = nil
         expected.config.llm.auth.allow_override = nil
 
+        -- llm_format
+        expected.config.llm_format = nil
+
         -- gemini fields
         expected.config.llm.auth.gcp_service_account_json = nil
         expected.config.llm.auth.gcp_use_service_account = nil
@@ -994,6 +1091,9 @@ describe("CP/DP config compat transformations #" .. strategy, function()
         expected.config.match_all_roles = nil
         expected.config.max_request_body_size = nil
 
+        -- llm_format
+        expected.config.llm_format = nil
+
         do_assert(uuid(), "3.7.0", expected)
 
         -- cleanup
@@ -1013,13 +1113,37 @@ describe("CP/DP config compat transformations #" .. strategy, function()
         }
         -- ]]
 
+        finally(function()
+          admin.plugins:remove({ id = prometheus.id })
+        end)
+
         local expected_prometheus_prior_38 = cycle_aware_deep_copy(prometheus)
         expected_prometheus_prior_38.config.ai_metrics = nil
+        expected_prometheus_prior_38.config.wasm_metrics = nil
 
         do_assert(uuid(), "3.7.0", expected_prometheus_prior_38)
+      end)
 
-        -- cleanup
-        admin.plugins:remove({ id = prometheus.id })
+      it("[prometheus] remove wasm_metrics property for versions below 3.10", function()
+        -- [[ 3.10.x ]] --
+        local prometheus = admin.plugins:insert {
+          name = "prometheus",
+          enabled = true,
+          config = {
+            wasm_metrics = true, -- becomes nil
+          },
+        }
+        -- ]]
+
+        finally(function()
+          admin.plugins:remove({ id = prometheus.id })
+        end)
+
+
+        local expected_prometheus_prior_310 = cycle_aware_deep_copy(prometheus)
+        expected_prometheus_prior_310.config.wasm_metrics = nil
+
+        do_assert(uuid(), "3.9.0", expected_prometheus_prior_310)
       end)
     end)
 

@@ -13,10 +13,10 @@ local STAGES = {
   REQ_POST_PROCESSING = 3,
   RES_INTROSPECTION = 4,
   RES_TRANSFORMATION = 5,
-
+  
   STREAMING = 6,
-
-  RES_POST_PROCESSING = 7,
+  RES_PRE_PROCESSING = 7, -- specially usage for konnect analytics
+  RES_POST_PROCESSING = 8,
 }
 
 -- Filters in those stages are allowed to execute more than one time in a request
@@ -48,7 +48,7 @@ local function run_stage(stage, sub_plugin, conf)
     elseif not ai_executed_filters[name] or REPEATED_PHASES[stage] then
       ai_executed_filters[name] = true
 
-      kong.log.debug("executing filter ", name)
+      kong.log.trace("executing filter ", name)
 
       local ok, err = f:run(conf)
       if not ok then
@@ -100,28 +100,6 @@ function MetaPlugin:rewrite(sub_plugin, conf)
 end
 
 function MetaPlugin:header_filter(sub_plugin, conf)
-  -- for error and exit response, just use plaintext headers
-  if kong.response.get_source() == "service" then
-    -- we use openai's streaming mode (SSE)
-    if get_global_ctx("stream_mode") then
-      -- we are going to send plaintext event-stream frames for ALL models
-      kong.response.set_header("Content-Type", "text/event-stream")
-      -- TODO: disable gzip for SSE because it needs immediate flush for each chunk
-      -- and seems nginx doesn't support it
-
-    elseif get_global_ctx("accept_gzip") then
-      -- for gzip response, don't set content-length at all to align with upstream
-      kong.response.clear_header("Content-Length")
-      kong.response.set_header("Content-Encoding", "gzip")
-
-    else
-      kong.response.clear_header("Content-Encoding")
-    end
-
-  else
-    kong.response.clear_header("Content-Encoding")
-  end
-
   run_stage(STAGES.REQ_POST_PROCESSING, sub_plugin, conf)
   -- TODO: order this in better place
   run_stage(STAGES.RES_INTROSPECTION, sub_plugin, conf)
@@ -138,7 +116,10 @@ function MetaPlugin:body_filter(sub_plugin, conf)
 
   -- check if we have generated a full body
   local body, source = get_global_ctx("response_body")
-  if body and source ~= ngx.ctx.ai_last_sent_response_source then
+  if not get_global_ctx("stream_mode") and body and source ~= ngx.ctx.ai_last_sent_response_source then
+    -- now do anything required before the LOG phase
+    run_stage(STAGES.RES_PRE_PROCESSING, sub_plugin, conf)
+
     assert(source, "response_body source not set")
 
     if get_global_ctx("accept_gzip") then
@@ -155,6 +136,10 @@ function MetaPlugin:body_filter(sub_plugin, conf)
 
   -- else run the streaming handler
   run_stage(STAGES.STREAMING, sub_plugin, conf)
+
+  if ngx.arg[2] then  -- streaming has finished
+    run_stage(STAGES.RES_PRE_PROCESSING, sub_plugin, conf)
+  end
 end
 
 function MetaPlugin:log(sub_plugin, conf)

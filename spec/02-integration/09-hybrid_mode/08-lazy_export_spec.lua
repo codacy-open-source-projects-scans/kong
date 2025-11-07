@@ -52,6 +52,10 @@ local function json_dp(rpc, rpc_sync)
     cluster_rpc = rpc,
     cluster_rpc_sync = rpc_sync,
   }))
+
+  if rpc_sync == "on" then
+    assert.logfile("dp1/logs/error.log").has.line("[kong.sync.v2] full sync ends", true, 10)
+  end
 end
 
 
@@ -93,7 +97,6 @@ describe("lazy_export with #".. strategy .. " rpc_sync=" .. rpc_sync, function()
       touch_config()
       if rpc_sync == "on" then
         assert.logfile().has.line("[kong.sync.v2] config push (connected client)", true)
-        assert.logfile().has.line("[kong.sync.v2] database is empty or too far behind for node_id", true)
 
       else
         assert.logfile().has.line("[clustering] exporting config", true)

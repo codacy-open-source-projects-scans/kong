@@ -1,10 +1,3 @@
--- This software is copyright Kong Inc. and its licensors.
--- Use of the software is subject to the agreement between your organization
--- and Kong Inc. If there is no such agreement, use is governed by and
--- subject to the terms of the Kong Master Software License Agreement found
--- at https://konghq.com/enterprisesoftwarelicense/.
--- [ END OF LICENSE 0867164ffc95e54f04670b5169c09574bdbd9bba ]
-
 local helpers
 local buffer
 local kong_global
@@ -203,10 +196,12 @@ describe("#off preserve nulls", function()
     local id, item = next(entities.basicauth_credentials)
 
     -- format changed after rpc sync
+    -- item key
     local cache_key = concat({
+      "I|",
       "basicauth_credentials|",
       item.ws_id,
-      "|*|",
+      "|",
       id
     })
 
@@ -226,13 +221,16 @@ describe("#off preserve nulls", function()
       if plugin.name == PLUGIN_NAME then
 
         -- format changed after rpc sync
+        -- foreign key:
         cache_key = concat({
+          "F|",
           "plugins|",
-          plugin.ws_id,
-          "|route|",
+          "route|",
           plugin.route.id,
           "|",
-          plugin.id
+          plugin.ws_id,
+          "|",
+          plugin.id,
         })
         value, err, hit_lvl = lmdb.get(cache_key)
         assert.is_nil(err)

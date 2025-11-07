@@ -43,7 +43,6 @@ cluster_use_proxy = off
 cluster_dp_labels = NONE
 cluster_rpc = off
 cluster_rpc_sync = off
-cluster_full_sync_threshold = 512
 cluster_cjson = off
 
 lmdb_environment_path = dbless.lmdb
@@ -212,6 +211,7 @@ untrusted_lua_sandbox_environment =
 admin_gui_url =
 admin_gui_path = /
 admin_gui_api_url = NONE
+admin_gui_csp_header = off
 
 openresty_path =
 

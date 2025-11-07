@@ -256,8 +256,9 @@ local function should_process_route(route)
 end
 
 
-local function load_service_from_db(service_pk)
-  local service, err = kong.db.services:select(service_pk, GLOBAL_QUERY_OPTS)
+local function load_service_from_db(service_pk, ws_id)
+  local options = ws_id and { workspace = ws_id, show_ws_id = true }
+  local service, err = kong.db.services:select(service_pk, options)
   if service == nil then
     -- the third value means "do not cache"
     return nil, err, -1
@@ -299,20 +300,21 @@ local function get_service_for_route(db, route, services_init_cache)
   end
 
   local err
+  local ws_id = route.ws_id
 
   -- kong.core_cache is available, not in init phase
   if kong.core_cache and db.strategy ~= "off" then
     local cache_key = db.services:cache_key(service_pk.id, nil, nil, nil, nil,
-                                            route.ws_id)
+                                            ws_id)
     service, err = kong.core_cache:get(cache_key, TTL_ZERO,
-                                       load_service_from_db, service_pk)
+                                       load_service_from_db, service_pk, ws_id)
 
   else -- dbless or init phase, kong.core_cache not needed/available
 
     -- A new service/route has been inserted while the initial route
     -- was being created, on init (perhaps by a different Kong node).
     -- Load the service individually and update services_init_cache with it
-    service, err = load_service_from_db(service_pk)
+    service, err = load_service_from_db(service_pk, ws_id)
     services_init_cache[id] = service
   end
 
@@ -386,7 +388,8 @@ local function new_router(version)
         end
 
         if new_version ~= version then
-          return nil, "router was changed while rebuilding it"
+          log(INFO, "could not build router: router was changed while rebuilding it")
+          return nil, nil
         end
       end
       counter = counter + 1
@@ -494,7 +497,7 @@ end
 local function get_updated_router()
   if kong.db.strategy ~= "off" and kong.configuration.worker_consistency == "strict" then
     local ok, err = rebuild_router(ROUTER_SYNC_OPTS)
-    if not ok then
+    if not ok and err then
       -- If an error happens while updating, log it and return non-updated
       -- version.
       log(ERR, "could not rebuild router: ", err, " (stale router will be used)")
@@ -868,27 +871,29 @@ end
 local function set_init_versions_in_cache()
   -- because of worker events, kong.cache can not be initialized in `init` phase
   -- therefore, we need to use the shdict API directly to set the initial value
-  assert(kong.configuration.role ~= "control_plane")
   assert(ngx.get_phase() == "init")
+
   local core_cache_shm = ngx.shared["kong_core_db_cache"]
 
   -- ttl = forever is okay as "*:versions" keys are always manually invalidated
   local marshalled_value = encode("init")
 
   -- see kong.cache.safe_set function
-  local ok, err = core_cache_shm:safe_set("kong_core_db_cacherouter:version", marshalled_value)
-  if not ok then
-    return nil, "failed to set initial router version in cache: " .. tostring(err)
-  end
-
-  ok, err = core_cache_shm:safe_set("kong_core_db_cacheplugins_iterator:version", marshalled_value)
+  local ok, err = core_cache_shm:safe_set("kong_core_db_cacheplugins_iterator:version", marshalled_value)
   if not ok then
     return nil, "failed to set initial plugins iterator version in cache: " .. tostring(err)
   end
 
-  ok, err = core_cache_shm:safe_set("kong_core_db_cachefilter_chains:version", marshalled_value)
-  if not ok then
-    return nil, "failed to set initial wasm filter chains version in cache: " .. tostring(err)
+  if kong.configuration.role ~= "control_plane" then
+    ok, err = core_cache_shm:safe_set("kong_core_db_cacherouter:version", marshalled_value)
+    if not ok then
+      return nil, "failed to set initial router version in cache: " .. tostring(err)
+    end
+
+    ok, err = core_cache_shm:safe_set("kong_core_db_cachefilter_chains:version", marshalled_value)
+    if not ok then
+      return nil, "failed to set initial wasm filter chains version in cache: " .. tostring(err)
+    end
   end
 
 
@@ -990,8 +995,30 @@ return {
       if strategy ~= "off" or kong.sync then
         local worker_state_update_frequency = kong.configuration.worker_state_update_frequency or 1
 
+        --[[
+                    +-----------+
+                    |   Start   | <-------------------------------------+
+                    +-----------+                                       |
+                          |                                             |
+                          |                                             |
+                          v                                             |
+                    ***************************           +-------+     |
+                    * Is reconfigure running? * ---Yes--->| Sleep | ----+
+                    ***************************           +-------+
+                          |                                   ^
+                          No                                  |
+                          |                                   |
+                          v                                   |
+                    +---------------+                         |
+                    | rebuild router|-------------------------+
+                    +---------------+
+
+            Since reconfigure will also rebuild the router, we skip this round
+            of rebuilding the router.
+        --]]
         local router_async_opts = {
-          name = "router",
+          name = RECONFIGURE_OPTS and RECONFIGURE_OPTS.name or "router", -- please check the above diagram for the
+                                        -- reason of using the same name as reconfigure
           timeout = 0,
           on_timeout = "return_true",
         }
@@ -1006,7 +1033,7 @@ return {
           -- If the semaphore is locked, that means that the rebuild is
           -- already ongoing.
           local ok, err = rebuild_router(router_async_opts)
-          if not ok then
+          if not ok and err then
             log(ERR, "could not rebuild router via timer: ", err)
           end
         end
@@ -1166,7 +1193,8 @@ return {
 
       ctx.scheme = var.scheme
       ctx.request_uri = var.request_uri
-
+      ctx.host = var.host
+      
       -- trace router
       local span = instrumentation.router()
       -- create the balancer span "in advance" so its ID is available
@@ -1208,7 +1236,7 @@ return {
         req_dyn_hook_run_hook("timing", "workspace_id:got", ctx.workspace)
       end
 
-      local host           = var.host
+      local host           = ctx.host
       local port           = ctx.host_port or tonumber(var.server_port, 10)
 
       local route          = match_t.route
@@ -1431,8 +1459,9 @@ return {
         return exit(500)
       end
 
+      local header_cache = {}
       -- clear hop-by-hop request headers:
-      local http_connection = get_header("connection", ctx)
+      local http_connection = get_header("connection", header_cache)
       if http_connection ~= "keep-alive" and
          http_connection ~= "close"      and
          http_connection ~= "upgrade"
@@ -1453,7 +1482,7 @@ return {
       end
 
       -- add te header only when client requests trailers (proxy removes it)
-      local http_te = get_header("te", ctx)
+      local http_te = get_header("te", header_cache)
       if http_te then
         if http_te == "trailers" then
           var.upstream_te = "trailers"
@@ -1468,11 +1497,11 @@ return {
         end
       end
 
-      if get_header("proxy", ctx) then
+      if get_header("proxy", header_cache) then
         clear_header("Proxy")
       end
 
-      if get_header("proxy_connection", ctx) then
+      if get_header("proxy_connection", header_cache) then
         clear_header("Proxy-Connection")
       end
     end

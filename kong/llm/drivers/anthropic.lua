@@ -7,6 +7,7 @@ local ai_shared = require("kong.llm.drivers.shared")
 local socket_url = require "socket.url"
 local buffer = require("string.buffer")
 local string_gsub = string.gsub
+local ai_plugin_ctx = require("kong.llm.plugin.ctx")
 --
 
 -- globals
@@ -127,6 +128,33 @@ local function to_tools(in_tools)
   return out_tools
 end
 
+local function to_tool_choice(openai_tool_choice)
+  -- See https://docs.anthropic.com/en/api/messages#body-tool-choice and
+  -- https://platform.openai.com/docs/api-reference/chat/create#chat-create-tool_choice
+  if type(openai_tool_choice) == "string" then
+    if openai_tool_choice == "required" then
+      return {type = "any"}
+    elseif openai_tool_choice == "none" or openai_tool_choice == "auto" then
+      return {type = openai_tool_choice}
+    else
+      kong.log.warn("invalid tool choice string: ", openai_tool_choice, ", expected 'required', 'none', or 'auto'")
+      return nil
+    end
+  end
+
+  if type(openai_tool_choice) == "table" then
+    if openai_tool_choice.type == "function" and openai_tool_choice["function"].name then
+      return {type = "tool", name = openai_tool_choice["function"].name}
+    end
+
+    kong.log.warn("invalid tool choice table: ", cjson.encode(openai_tool_choice))
+    return nil
+  end
+
+  kong.log.warn("invalid tool choice type: ", type(openai_tool_choice), ", expected string or table")
+  return nil
+end
+
 local transformers_to = {
   ["llm/v1/chat"] = function(request_table, model)
     local messages = {}
@@ -144,7 +172,7 @@ local transformers_to = {
 
     -- handle function calling translation from OpenAI format
     messages.tools = request_table.tools and to_tools(request_table.tools)
-    messages.tool_choice = request_table.tool_choice
+    messages.tool_choice = request_table.tool_choice and to_tool_choice(request_table.tool_choice)
 
     return messages, "application/json", nil
   end,
@@ -514,23 +542,28 @@ end
 
 -- returns err or nil
 function _M.configure_request(conf)
+  local model = ai_plugin_ctx.get_request_model_table_inuse()
+  if not model or type(model) ~= "table" or model.provider ~= DRIVER_NAME then
+    return nil, "invalid model parameter"
+  end
+
   local parsed_url
 
-  if conf.model.options.upstream_url then
-    parsed_url = socket_url.parse(conf.model.options.upstream_url)
+  if model.options.upstream_url then
+    parsed_url = socket_url.parse(model.options.upstream_url)
   else
     parsed_url = socket_url.parse(ai_shared.upstream_url_format[DRIVER_NAME])
-    parsed_url.path = (conf.model.options and
-                        conf.model.options.upstream_path)
+    parsed_url.path = (model.options and
+                        model.options.upstream_path)
                       or (ai_shared.operation_map[DRIVER_NAME][conf.route_type] and
                         ai_shared.operation_map[DRIVER_NAME][conf.route_type].path)
                       or "/"
   end
 
-  ai_shared.override_upstream_url(parsed_url, conf)
+  ai_shared.override_upstream_url(parsed_url, conf, model)
 
   -- if the path is read from a URL capture, ensure that it is valid
-  parsed_url.path = string_gsub(parsed_url.path, "^/*", "/")
+  parsed_url.path = (parsed_url.path and string_gsub(parsed_url.path, "^/*", "/")) or "/"
 
   kong.service.request.set_path(parsed_url.path)
   kong.service.request.set_scheme(parsed_url.scheme)
@@ -538,7 +571,7 @@ function _M.configure_request(conf)
 
 
 
-  kong.service.request.set_header("anthropic-version", conf.model.options.anthropic_version)
+  kong.service.request.set_header("anthropic-version", model.options.anthropic_version)
 
   local auth_header_name = conf.auth and conf.auth.header_name
   local auth_header_value = conf.auth and conf.auth.header_value

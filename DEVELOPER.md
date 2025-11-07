@@ -204,6 +204,9 @@ Now you can start Kong:
 # Use the pre-defined docker-compose file to bring up databases etc
 start_services
 
+# Bootstrap the database
+kong migrations bootstrap
+
 # Start Kong!
 kong start
 
@@ -273,7 +276,7 @@ Finally, all suites can be run at once by simply using:
 make test-all
 ```
 
-Consult the [run_tests.sh](.ci/run_tests.sh) script for more advanced example
+Consult the [test_suites.json](.ci/test_suites.json) json file for more advanced example
 usage of the test suites and the Makefile.
 
 Finally, a very useful tool in Lua development (as with many other dynamic
